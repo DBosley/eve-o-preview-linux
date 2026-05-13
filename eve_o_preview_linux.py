@@ -766,153 +766,313 @@ def is_eve_window_steamaware(wnck_window):
         return True
     return False
 
-class _KGlobalAccel:
-    """In-process KDE Plasma global-shortcut binding for EVE slot keys.
+class _PortalGlobalShortcuts:
+    """xdg-desktop-portal GlobalShortcuts integration (Wayland-native).
 
-    Registers Meta+N actions with the org.kde.kglobalaccel D-Bus service on
-    demand and tears them down when the corresponding EVE client disappears
-    or when the app exits. Subscribes to ``globalShortcutPressed`` and calls
-    ``on_pressed(slot:int)`` from inside the GTK main loop.
+    On Plasma 6 Wayland, third-party processes cannot reliably bind global
+    shortcuts via the legacy kglobalaccel D-Bus API — kglobalaccel accepts
+    the registration but KWin's keyboard input router doesn't pick it up.
+    The supported third-party path is the freedesktop portal at
+    ``org.freedesktop.portal.Desktop`` interface
+    ``org.freedesktop.portal.GlobalShortcuts``.
 
-    Designed to fail gracefully on non-KDE desktops — the service simply will
-    not be exported, ``__init__`` will raise, and the caller is expected to
-    swallow the exception and continue in degraded mode.
+    Flow (all asynchronous, gated on Response signals):
+      1. CreateSession → portal returns a request object; on Response the
+         results contain ``session_handle``.
+      2. BindShortcuts(session, [(id, props), …]) → portal shows the
+         "Allow this app to bind …?" dialog. On Response the bindings are
+         live.
+      3. Subscribe to ``Activated(session, id, timestamp, options)``.
+      4. On press, dispatch ``on_pressed(slot:int)`` from the GTK main loop.
+
+    Session lifetime is process-bound. Binding-list changes during the
+    session (slots opening/closing) are batched via ``set_desired_shortcuts``
+    + ``rebind`` — the portal does not currently support incremental
+    add/remove on an existing session, so rebind reissues the whole set.
     """
 
-    COMPONENT_UNIQUE = "eve-o-preview"
-    COMPONENT_FRIENDLY = "EVE-O Preview"
+    SERVICE = "org.freedesktop.portal.Desktop"
+    PATH = "/org/freedesktop/portal/desktop"
+    IFACE = "org.freedesktop.portal.GlobalShortcuts"
+    REQ_IFACE = "org.freedesktop.portal.Request"
 
-    # Qt constants — kglobalaccel expects (Qt::Key | Qt::Modifier) ints.
-    META_MODIFIER = 0x10000000     # Qt::MetaModifier
-    SHIFT_MODIFIER = 0x02000000    # Qt::ShiftModifier
-    CTRL_MODIFIER = 0x04000000     # Qt::ControlModifier
-    ALT_MODIFIER = 0x08000000      # Qt::AltModifier
-    KEY_0 = 0x30                   # Qt::Key_0 ; Key_N = 0x30 + N
-
-    # Default modifier combo for slot keys. Plasma reserves plain Meta+1..9
-    # for "Activate Task Manager Entry N"; Meta+Shift+N is uncontested by
-    # default and stays muscle-memory-adjacent.
-    DEFAULT_MODIFIER = META_MODIFIER | SHIFT_MODIFIER
-
-    # SetShortcut flags (from kglobalaccel_interface.h)
-    FLAG_SET_PRESENT = 0x2
-    FLAG_NO_AUTOLOADING = 0x4
-
-    def __init__(self, on_pressed):
+    def __init__(self, on_pressed, on_state_change=None):
         from gi.repository import Gio as _Gio
         self._Gio = _Gio
         self._on_pressed = on_pressed
-        self._registered = {}  # slot:int → action_id:tuple(str×4)
-        self._subscription_id = None
-
-        # Will raise if the service isn't reachable — caller handles.
+        self._on_state_change = on_state_change or (lambda _s: None)
         self._bus = _Gio.bus_get_sync(_Gio.BusType.SESSION, None)
-        # Probe the service so we fail fast on non-KDE setups.
+
+        # Probe — raises on non-portal setups.
         self._bus.call_sync(
-            "org.kde.kglobalaccel", "/kglobalaccel",
-            "org.freedesktop.DBus.Peer", "Ping",
+            self.SERVICE, self.PATH, "org.freedesktop.DBus.Peer", "Ping",
             None, None, _Gio.DBusCallFlags.NONE, 2000, None,
         )
 
+        unique = self._bus.get_unique_name() or ""
+        self._sender_path = unique.lstrip(":").replace(".", "_")
+
+        self._session_handle = None
+        self._activated_sub = None
+        self._desired = []   # list of (id_str, label_str, preferred_trigger_str)
+        self._bound_ids = set()
+        self._state = "idle"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def state(self):
+        return self._state
+
+    def bound_ids(self):
+        return set(self._bound_ids)
+
+    def set_desired_shortcuts(self, shortcuts):
+        """shortcuts: iterable of (shortcut_id, description, preferred_trigger)."""
+        self._desired = [tuple(s) for s in shortcuts]
+
     def start(self):
-        """Begin listening for shortcut-press signals on our component."""
-        if self._subscription_id is not None:
+        """Kick off CreateSession → BindShortcuts → Subscribe."""
+        if self._state not in ("idle", "error"):
             return
-        path = f"/component/{self.COMPONENT_UNIQUE}"
-        self._subscription_id = self._bus.signal_subscribe(
-            "org.kde.kglobalaccel",
-            "org.kde.kglobalaccel.Component",
-            "globalShortcutPressed",
-            path,
-            None,
-            self._Gio.DBusSignalFlags.NONE,
-            self._on_signal,
-        )
+        self._set_state("creating-session")
+        self._create_session()
 
     def stop(self):
-        if self._subscription_id is not None:
+        """Tear down the session and signal subscription."""
+        if self._activated_sub is not None:
             try:
-                self._bus.signal_unsubscribe(self._subscription_id)
+                self._bus.signal_unsubscribe(self._activated_sub)
             except Exception:
                 pass
-            self._subscription_id = None
+            self._activated_sub = None
+        if self._session_handle is not None:
+            try:
+                self._bus.call_sync(
+                    self.SERVICE, self._session_handle,
+                    "org.freedesktop.portal.Session", "Close",
+                    None, None, self._Gio.DBusCallFlags.NONE, 2000, None,
+                )
+            except Exception:
+                pass
+            self._session_handle = None
+        self._bound_ids = set()
+        self._set_state("idle")
 
-    def _on_signal(self, _conn, _sender, _path, _iface, _signal, params):
+    def rebind(self):
+        """Reissue BindShortcuts with the current _desired list. No-op until
+        the session is active."""
+        if self._session_handle is None:
+            return
+        self._set_state("binding-shortcuts")
+        self._bind_shortcuts()
+
+    # ------------------------------------------------------------------
+    # Internal: state + tokens
+    # ------------------------------------------------------------------
+    def _set_state(self, s):
+        self._state = s
         try:
-            component_unique, action_unique, _timestamp = params.unpack()
+            self._on_state_change(s)
         except Exception:
+            pass
+
+    def _gen_token(self, prefix):
+        import secrets
+        return f"{prefix}_{secrets.token_hex(6)}"
+
+    def _request_path(self, handle_token):
+        return f"/org/freedesktop/portal/desktop/request/{self._sender_path}/{handle_token}"
+
+    @staticmethod
+    def _vardict(d):
+        """Build a GVariant of type a{sv} from a Python dict {str: Variant}.
+        PyGObject's `GLib.Variant('a{sv}', d)` constructor raises KeyError(0)
+        when values are Variants — VariantBuilder avoids that ambiguity."""
+        builder = GLib.VariantBuilder.new(GLib.VariantType("a{sv}"))
+        for k, v in d.items():
+            builder.add_value(GLib.Variant("{sv}", (k, v)))
+        return builder.end()
+
+    @staticmethod
+    def _shortcut_array(entries):
+        """Build a GVariant of type a(sa{sv}) for BindShortcuts.
+
+        ``entries`` is a list of (id_str, props_dict_of_variants).
+        """
+        builder = GLib.VariantBuilder.new(GLib.VariantType("a(sa{sv})"))
+        for sid, props in entries:
+            props_builder = GLib.VariantBuilder.new(GLib.VariantType("a{sv}"))
+            for k, v in props.items():
+                props_builder.add_value(GLib.Variant("{sv}", (k, v)))
+            tup = GLib.Variant.new_tuple(
+                GLib.Variant("s", sid),
+                props_builder.end(),
+            )
+            builder.add_value(tup)
+        return builder.end()
+
+    def _subscribe_response(self, handle_token, on_response):
+        """Subscribe to the Response signal for a specific request path.
+        Returns the subscription id. The handler is responsible for
+        unsubscribing once done."""
+        path = self._request_path(handle_token)
+        return self._bus.signal_subscribe(
+            None, self.REQ_IFACE, "Response", path, None,
+            self._Gio.DBusSignalFlags.NONE, on_response,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 1: CreateSession
+    # ------------------------------------------------------------------
+    def _create_session(self):
+        handle_token = self._gen_token("evepreview_cs")
+        session_token = self._gen_token("evepreview_session")
+
+        sub_holder = [None]
+        def on_response(_conn, _sender, _path, _iface, _signal, params):
+            if sub_holder[0] is not None:
+                try:
+                    self._bus.signal_unsubscribe(sub_holder[0])
+                except Exception:
+                    pass
+                sub_holder[0] = None
+            try:
+                response_code, results = params.unpack()
+            except Exception as e:
+                print(f"[portal] CreateSession response unpack failed: {e}")
+                self._set_state("error: response unpack")
+                return
+            if response_code != 0:
+                print(f"[portal] CreateSession refused (code {response_code})")
+                self._set_state(f"error: CreateSession code {response_code}")
+                return
+            self._session_handle = results.get("session_handle") \
+                or f"/org/freedesktop/portal/desktop/session/{self._sender_path}/{session_token}"
+            print(f"[portal] session = {self._session_handle}")
+            self._subscribe_activated()
+            self._set_state("binding-shortcuts")
+            self._bind_shortcuts()
+
+        sub_holder[0] = self._subscribe_response(handle_token, on_response)
+
+        options = self._vardict({
+            "handle_token": GLib.Variant("s", handle_token),
+            "session_handle_token": GLib.Variant("s", session_token),
+        })
+        try:
+            self._bus.call_sync(
+                self.SERVICE, self.PATH, self.IFACE, "CreateSession",
+                GLib.Variant.new_tuple(options),
+                None, self._Gio.DBusCallFlags.NONE, 5000, None,
+            )
+        except Exception as e:
+            print(f"[portal] CreateSession call failed: {e}")
+            if sub_holder[0] is not None:
+                try:
+                    self._bus.signal_unsubscribe(sub_holder[0])
+                except Exception:
+                    pass
+            self._set_state(f"error: {e}")
+
+    # ------------------------------------------------------------------
+    # Step 2: BindShortcuts
+    # ------------------------------------------------------------------
+    def _bind_shortcuts(self):
+        if self._session_handle is None or not self._desired:
+            self._bound_ids = set()
+            self._set_state("idle" if not self._desired else "no-session")
             return
-        if component_unique != self.COMPONENT_UNIQUE:
+
+        handle_token = self._gen_token("evepreview_bs")
+
+        # Build shortcut array: a(sa{sv})
+        shortcut_entries = []
+        for shortcut_id, description, preferred in self._desired:
+            props = {
+                "description": GLib.Variant("s", description),
+            }
+            if preferred:
+                props["preferred_trigger"] = GLib.Variant("s", preferred)
+            shortcut_entries.append((shortcut_id, props))
+
+        shortcuts_variant = self._shortcut_array(shortcut_entries)
+
+        sub_holder = [None]
+        def on_response(_conn, _sender, _path, _iface, _signal, params):
+            if sub_holder[0] is not None:
+                try:
+                    self._bus.signal_unsubscribe(sub_holder[0])
+                except Exception:
+                    pass
+                sub_holder[0] = None
+            try:
+                response_code, results = params.unpack()
+            except Exception as e:
+                print(f"[portal] BindShortcuts response unpack failed: {e}")
+                self._set_state("error: bind response unpack")
+                return
+            if response_code != 0:
+                print(f"[portal] BindShortcuts refused (code {response_code})")
+                self._set_state(f"error: BindShortcuts code {response_code}")
+                return
+            shortcuts = results.get("shortcuts", []) or []
+            self._bound_ids = {s[0] for s in shortcuts}
+            print(f"[portal] bound: {sorted(self._bound_ids)}")
+            self._set_state("active")
+
+        sub_holder[0] = self._subscribe_response(handle_token, on_response)
+
+        options = self._vardict({
+            "handle_token": GLib.Variant("s", handle_token),
+        })
+        try:
+            self._bus.call_sync(
+                self.SERVICE, self.PATH, self.IFACE, "BindShortcuts",
+                GLib.Variant.new_tuple(
+                    GLib.Variant("o", self._session_handle),
+                    shortcuts_variant,
+                    GLib.Variant("s", ""),  # parent_window — unused
+                    options,
+                ),
+                None, self._Gio.DBusCallFlags.NONE, 5000, None,
+            )
+        except Exception as e:
+            print(f"[portal] BindShortcuts call failed: {e}")
+            if sub_holder[0] is not None:
+                try:
+                    self._bus.signal_unsubscribe(sub_holder[0])
+                except Exception:
+                    pass
+            self._set_state(f"error: {e}")
+
+    # ------------------------------------------------------------------
+    # Step 3: Activated signal subscription
+    # ------------------------------------------------------------------
+    def _subscribe_activated(self):
+        if self._activated_sub is not None:
             return
-        if not action_unique.startswith("switch_slot_"):
+        self._activated_sub = self._bus.signal_subscribe(
+            None, self.IFACE, "Activated", self.PATH, None,
+            self._Gio.DBusSignalFlags.NONE, self._on_activated,
+        )
+        print(f"[portal] subscribed to Activated (sub_id={self._activated_sub})")
+
+    def _on_activated(self, _conn, sender, path, iface, signal, params):
+        try:
+            session_handle, shortcut_id, _timestamp, _options = params.unpack()
+        except Exception as e:
+            print(f"[portal] Activated unpack failed: {e}")
+            return
+        if self._session_handle is not None and session_handle != self._session_handle:
+            return  # different session — not for us
+        if not shortcut_id.startswith("switch_slot_"):
             return
         try:
-            slot = int(action_unique.rsplit("_", 1)[-1])
+            slot = int(shortcut_id.rsplit("_", 1)[-1])
         except ValueError:
             return
-        # Dispatch from the GTK main loop to keep all window manipulation on
-        # the main thread (D-Bus signals can arrive on the bus thread).
         GLib.idle_add(self._on_pressed, slot)
-
-    def _action_id(self, slot):
-        slot_str = str(slot)
-        return [
-            self.COMPONENT_UNIQUE,
-            f"switch_slot_{slot_str}",
-            self.COMPONENT_FRIENDLY,
-            f"Switch to EVE slot {slot_str}",
-        ]
-
-    def _qt_key_for_slot(self, slot):
-        # slot 10 conceptually maps to digit 0; we expect slots 1..9 in practice.
-        digit = slot if slot != 10 else 0
-        return self.DEFAULT_MODIFIER | (self.KEY_0 + digit)
-
-    def register_slot(self, slot):
-        """Idempotent: register Meta+slot if not already registered."""
-        if slot in self._registered:
-            return
-        action_id = self._action_id(slot)
-        try:
-            self._bus.call_sync(
-                "org.kde.kglobalaccel", "/kglobalaccel",
-                "org.kde.KGlobalAccel", "doRegister",
-                GLib.Variant("(as)", (action_id,)),
-                None, self._Gio.DBusCallFlags.NONE, 3000, None,
-            )
-            keys = [self._qt_key_for_slot(slot)]
-            self._bus.call_sync(
-                "org.kde.kglobalaccel", "/kglobalaccel",
-                "org.kde.KGlobalAccel", "setShortcut",
-                GLib.Variant("(asaiu)",
-                             (action_id, keys,
-                              self.FLAG_SET_PRESENT | self.FLAG_NO_AUTOLOADING)),
-                None, self._Gio.DBusCallFlags.NONE, 3000, None,
-            )
-            self._registered[slot] = tuple(action_id)
-        except Exception as e:
-            print(f"[kga] register slot {slot} failed: {e}")
-
-    def unregister_slot(self, slot):
-        action_id = self._registered.pop(slot, None)
-        if action_id is None:
-            return
-        try:
-            self._bus.call_sync(
-                "org.kde.kglobalaccel", "/kglobalaccel",
-                "org.kde.KGlobalAccel", "unRegister",
-                GLib.Variant("(as)", (list(action_id),)),
-                None, self._Gio.DBusCallFlags.NONE, 3000, None,
-            )
-        except Exception as e:
-            print(f"[kga] unregister slot {slot} failed: {e}")
-
-    def unregister_all(self):
-        for slot in list(self._registered.keys()):
-            self.unregister_slot(slot)
-
-    def active_slots(self):
-        return list(self._registered.keys())
 
 
 class Config:
@@ -1621,16 +1781,22 @@ class EVEOPreview(Gtk.Window):
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()
 
-        # In-process KDE global-shortcut binder. Optional: silently disabled
-        # on non-KDE setups or if the user has turned it off in settings.
-        self._kga = None
+        # xdg-desktop-portal GlobalShortcuts is the Wayland-native path for
+        # third-party processes to bind global hotkeys. The portal client is
+        # instantiated here but the handshake (which shows a permission
+        # dialog) is NOT triggered until the user clicks "Register" in the
+        # Hotkeys settings tab. This avoids surprising the meatbag with a
+        # dialog on every launch.
+        self._portal = None
         if self.config.settings.get("kde_hotkeys_enabled", True):
             try:
-                self._kga = _KGlobalAccel(on_pressed=self._on_hotkey_pressed)
-                self._kga.start()
+                self._portal = _PortalGlobalShortcuts(
+                    on_pressed=self._on_hotkey_pressed,
+                    on_state_change=self._on_portal_state,
+                )
             except Exception as e:
-                print(f"[kga] disabled: {e}")
-                self._kga = None
+                print(f"[portal] disabled: {e}")
+                self._portal = None
 
         self.set_title("EVE-O Preview")
         self.set_default_size(500, 400)
@@ -1728,6 +1894,29 @@ class EVEOPreview(Gtk.Window):
 
         self._scan_existing()
         GLib.timeout_add(2000, self._periodic_client_scan)
+
+    def register_global_shortcuts(self):
+        """User-initiated: open the portal permission dialog for slots
+        1..max_hotkey_slots. Triggered by the Settings → Hotkeys button."""
+        if self._portal is None:
+            return False
+        max_slots = int(self.config.settings.get("max_hotkey_slots", 9) or 9)
+        desired = []
+        for slot in range(1, max_slots + 1):
+            desired.append((
+                f"switch_slot_{slot}",
+                f"EVE Online — Activate slot {slot}",
+                f"Meta+Shift+{slot}",
+            ))
+        self._portal.set_desired_shortcuts(desired)
+        # If a session already exists, rebind (re-prompts the user); otherwise
+        # do the full CreateSession + BindShortcuts handshake.
+        if self._portal.state() == "active":
+            self._portal.rebind()
+        else:
+            self._portal.stop()  # idempotent — ensures clean state
+            self._portal.start()
+        return True
 
     def _apply_styles(self):
         css_provider = Gtk.CssProvider()
@@ -1828,7 +2017,14 @@ class EVEOPreview(Gtk.Window):
         label.set_ellipsize(3)  # Ellipsize at end
         row_box.pack_start(label, True, True, 0)
         
-        row.add(row_box)
+        # Wrap row_box in an EventBox so we can capture right-clicks for the
+        # slot-binding popup menu. The EventBox lives BETWEEN row and row_box
+        # so that ListBoxRow's selection logic stays intact for left-clicks.
+        evbox = Gtk.EventBox()
+        evbox.add(row_box)
+        evbox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        evbox.connect("button-press-event", self._on_client_row_button, window)
+        row.add(evbox)
         self.client_list.add(row)
         row.show_all()
         self.client_rows[xid] = row
@@ -1838,15 +2034,37 @@ class EVEOPreview(Gtk.Window):
             display = raw
             if " - " in raw:
                 display = raw.split(" - ", 1)[1].split("[")[0].strip()
-            label.set_text(display)
+            # Decorate with the current slot binding if one exists.
+            bindings = self._compute_slot_bindings()
+            slot_num = None
+            for slot_str, info in bindings.items():
+                if info.get("character_name") == display:
+                    slot_num = slot_str
+                    break
+            if slot_num:
+                label.set_markup(
+                    f"<tt>[{slot_num}]</tt>  {GLib.markup_escape_text(display)}"
+                )
+            else:
+                label.set_text(display)
             # Title change can mean a different character logged in on the
             # same client window — re-emit slots.json with the new name.
             self._write_slots_state()
         window.connect("name-changed", _refresh_row_label)
         _refresh_row_label()
 
+        # Stash the label refresher so right-click menu actions can re-trigger it.
+        row._refresh_label = _refresh_row_label
+
         self._update_status()
         self._write_slots_state()
+        # Refresh all row labels (since a newly-detected client may have
+        # been auto-assigned a slot that affects how it displays).
+        for r in self.client_rows.values():
+            try:
+                r._refresh_label()
+            except Exception:
+                pass
 
     def _remove_thumb(self, xid):
         t = self.thumbnails.pop(xid, None)
@@ -2112,30 +2330,32 @@ class EVEOPreview(Gtk.Window):
             print(f"[slots] write error: {e}")
             bindings = {}
 
-        # Reconcile kglobalaccel: register newly-bound slots, unregister freed ones.
-        if self._kga is not None and self.config.settings.get("kde_hotkeys_enabled", True):
+        # Portal bindings are FIXED at startup (slots 1..max_hotkey_slots).
+        # We do not re-bind when EVE clients open/close — slots.json provides
+        # the dynamic slot→character mapping that _on_hotkey_pressed reads.
+        # If the user has disabled hotkeys, tear down the session.
+        if self._portal is not None and not self.config.settings.get(
+            "kde_hotkeys_enabled", True
+        ):
             try:
-                desired = {int(s) for s in bindings.keys()}
-                active = set(self._kga.active_slots())
-                for slot in active - desired:
-                    self._kga.unregister_slot(slot)
-                for slot in desired - active:
-                    self._kga.register_slot(slot)
+                self._portal.stop()
             except Exception as e:
-                print(f"[kga] reconcile error: {e}")
-        elif self._kga is not None:
-            # User disabled hotkeys — drop everything we currently hold.
-            try:
-                self._kga.unregister_all()
-            except Exception as e:
-                print(f"[kga] disable cleanup error: {e}")
+                print(f"[portal] disable cleanup error: {e}")
 
     def _on_hotkey_pressed(self, slot):
-        """kglobalaccel callback: activate the EVE window bound to ``slot``."""
+        """kglobalaccel callback: activate the EVE window bound to ``slot``.
+
+        Uses the same activation cascade the thumbnail click path uses
+        (wmctrl → xdotool → Xlib → Wnck) because plain Wnck.activate from a
+        D-Bus signal context has no current-event timestamp and is rejected
+        by KDE focus-stealing prevention.
+        """
+        import subprocess
         try:
             bindings = self._compute_slot_bindings()
             entry = bindings.get(str(slot))
             if not entry:
+                print(f"[kga] slot {slot} not bound — ignored")
                 return False
             target_xid_hex = entry.get("xid", "")
             try:
@@ -2145,19 +2365,134 @@ class EVEOPreview(Gtk.Window):
             thumb = self.thumbnails.get(target_xid)
             if thumb is None:
                 return False
-            self._activate_window(thumb.wnck_window)
+            wnck_w = thumb.wnck_window
+
+            # Stage 1: unminimize if needed (cheap, always safe).
+            try:
+                if wnck_w.is_minimized():
+                    wnck_w.unminimize(Gtk.get_current_event_time())
+            except Exception:
+                pass
+
+            # Stage 2: wmctrl by xid — most reliable on KDE/XWayland.
+            xid_hex = f"0x{target_xid:08x}"
+            ok = False
+            try:
+                r = subprocess.run(["wmctrl", "-ia", xid_hex],
+                                   capture_output=True, timeout=2)
+                ok = (r.returncode == 0)
+            except Exception:
+                ok = False
+
+            # Stage 3: xdotool fallback.
+            if not ok:
+                try:
+                    r = subprocess.run(["xdotool", "windowactivate", "--sync",
+                                        str(target_xid)],
+                                       capture_output=True, timeout=2)
+                    ok = (r.returncode == 0)
+                except Exception:
+                    ok = False
+
+            # Stage 4: raw Xlib _NET_ACTIVE_WINDOW + XSetInputFocus.
+            if not ok:
+                try:
+                    _net_activate_window(target_xid,
+                                         Gtk.get_current_event_time() or 0)
+                    ok = True
+                except Exception:
+                    ok = False
+
+            # Stage 5: Wnck activate — last resort.
+            if not ok:
+                try:
+                    wnck_w.activate(Gtk.get_current_event_time() or 0)
+                except Exception:
+                    pass
+
+            print(f"[kga] slot {slot} ({entry.get('character_name','?')}) "
+                  f"activated via {'wmctrl' if ok else 'fallback'}")
         except Exception as e:
             print(f"[kga] press handler error: {e}")
         return False  # one-shot idle callback
 
-    def shutdown_hotkeys(self):
-        """Tear down all kglobalaccel registrations. Called from main() on exit."""
-        if self._kga is not None:
+    def _on_client_row_button(self, widget, event, wnck_window):
+        """Right-click on a client row: pop up a menu to bind it to a slot."""
+        if event.button != 3:  # 3 = right
+            return False
+        # Resolve the character name for this row.
+        xid = wnck_window.get_xid()
+        char_name = self._character_name_for_xid(xid)
+        if not char_name:
+            return False
+
+        max_slots = int(self.config.settings.get("max_hotkey_slots", 9) or 9)
+        current = (self.config.settings.get("slot_assignments", {}) or {}).get(char_name)
+
+        menu = Gtk.Menu()
+        header = Gtk.MenuItem(label=f"Bind \"{char_name}\" to:")
+        header.set_sensitive(False)
+        menu.append(header)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        for slot in range(1, max_slots + 1):
+            lbl = f"Slot {slot}  (Meta+Shift+{slot})"
+            if current == slot:
+                lbl = f"● {lbl}"
+            item = Gtk.MenuItem(label=lbl)
+            item.connect(
+                "activate",
+                lambda _w, s=slot, c=char_name: self._set_character_slot(c, s),
+            )
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        auto = Gtk.MenuItem(label="Auto (no preferred slot)")
+        if not current:
+            auto.set_label("● Auto (no preferred slot)")
+        auto.connect("activate", lambda _w, c=char_name: self._set_character_slot(c, 0))
+        menu.append(auto)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def _set_character_slot(self, char_name, slot):
+        """Bind a character to a specific slot (0 = unset). Clears any other
+        character that was claiming that slot, so right-click reassignments
+        produce intuitive single-active-per-slot results."""
+        assignments = dict(self.config.settings.get("slot_assignments", {}) or {})
+        if slot > 0:
+            # Evict any other char currently assigned to this slot.
+            for other, other_slot in list(assignments.items()):
+                try:
+                    if int(other_slot) == int(slot) and other != char_name:
+                        assignments.pop(other, None)
+                except (TypeError, ValueError):
+                    pass
+            assignments[char_name] = int(slot)
+        else:
+            assignments.pop(char_name, None)
+        self.config.settings["slot_assignments"] = assignments
+        self.config.save()
+        self._write_slots_state()
+        for r in self.client_rows.values():
             try:
-                self._kga.unregister_all()
-                self._kga.stop()
+                r._refresh_label()
+            except Exception:
+                pass
+
+    def _on_portal_state(self, state):
+        """Receive state transitions from the portal client (logging hook)."""
+        print(f"[portal] state → {state}")
+
+    def shutdown_hotkeys(self):
+        """Tear down portal session and signal subscription. Called on exit."""
+        if self._portal is not None:
+            try:
+                self._portal.stop()
             except Exception as e:
-                print(f"[kga] shutdown error: {e}")
+                print(f"[portal] shutdown error: {e}")
 
     def _show_settings(self, _btn):
         dialog = SettingsDialog(self, self.config)
@@ -2676,14 +3011,14 @@ class SettingsDialog(Gtk.Dialog):
         sep.set_margin_bottom(8)
         vbox.pack_start(sep, False, False, 0)
 
-        # In-process kglobalaccel registration status
-        kde_label = Gtk.Label(label="KDE Global Shortcuts")
+        # xdg-desktop-portal GlobalShortcuts controls
+        kde_label = Gtk.Label(label="Global Shortcuts (Wayland portal)")
         kde_label.set_halign(Gtk.Align.START)
         kde_label.get_style_context().add_class("section-title")
         vbox.pack_start(kde_label, False, False, 0)
 
         self.kde_enable_chk = Gtk.CheckButton(
-            label="Enable Meta+Shift+1…Meta+Shift+N for detected EVE clients"
+            label="Enable global hotkeys"
         )
         self.kde_enable_chk.set_active(
             bool(self.config.settings.get("kde_hotkeys_enabled", True))
@@ -2691,22 +3026,55 @@ class SettingsDialog(Gtk.Dialog):
         self.kde_enable_chk.set_margin_start(8)
         vbox.pack_start(self.kde_enable_chk, False, False, 0)
 
+        # Max-slots spinner row
+        slots_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        slots_row.set_margin_start(8)
+        slots_row.set_margin_top(4)
+        slots_lbl = Gtk.Label(label="Number of slots:")
+        slots_lbl.set_xalign(0)
+        slots_row.pack_start(slots_lbl, False, False, 0)
+        self.max_slots_spin = Gtk.SpinButton()
+        self.max_slots_spin.set_range(1, 9)
+        self.max_slots_spin.set_increments(1, 1)
+        self.max_slots_spin.set_value(
+            int(self.config.settings.get("max_hotkey_slots", 9) or 9)
+        )
+        slots_row.pack_start(self.max_slots_spin, False, False, 0)
+        slots_unit = Gtk.Label(label="(Meta+Shift+1 through Meta+Shift+N)")
+        slots_unit.set_xalign(0)
+        slots_row.pack_start(slots_unit, True, True, 0)
+        vbox.pack_start(slots_row, False, False, 0)
+
         kde_hint = Gtk.Label()
         kde_hint.set_markup(
-            "<small>Bindings are registered when each client is detected and removed "
-            "when the client closes or this app exits. No setup needed — the registration "
-            "happens automatically via the kglobalaccel D-Bus service.</small>"
+            "<small>Click <i>Register Shortcuts</i> to open the permission "
+            "dialog. After approval, Meta+Shift+1…N activate whichever EVE "
+            "client is currently bound to each slot. The slot→character "
+            "mapping updates live as clients open and close.</small>"
         )
         kde_hint.set_line_wrap(True)
         kde_hint.set_xalign(0)
         kde_hint.set_margin_start(8)
-        kde_hint.set_margin_top(2)
+        kde_hint.set_margin_top(4)
         kde_hint.set_margin_bottom(6)
         vbox.pack_start(kde_hint, False, False, 0)
+
+        # Register button + status
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.set_margin_start(8)
+        self._register_btn = Gtk.Button(label="Register Shortcuts")
+        self._register_btn.connect("clicked", self._on_register_clicked)
+        btn_row.pack_start(self._register_btn, False, False, 0)
+
+        self._unregister_btn = Gtk.Button(label="Unregister")
+        self._unregister_btn.connect("clicked", self._on_unregister_clicked)
+        btn_row.pack_start(self._unregister_btn, False, False, 0)
+        vbox.pack_start(btn_row, False, False, 0)
 
         self._kde_status_lbl = Gtk.Label()
         self._kde_status_lbl.set_xalign(0)
         self._kde_status_lbl.set_margin_start(8)
+        self._kde_status_lbl.set_margin_top(6)
         self._refresh_kde_status_label()
         vbox.pack_start(self._kde_status_lbl, False, False, 0)
 
@@ -2723,28 +3091,68 @@ class SettingsDialog(Gtk.Dialog):
 
         return vbox
 
-    def _refresh_kde_status_label(self):
-        if self._parent_app is None or self._parent_app._kga is None:
+    def _on_register_clicked(self, _btn):
+        if self._parent_app is None:
+            return
+        # Persist the spinner value first so register_global_shortcuts() reads it.
+        try:
+            self.config.settings["max_hotkey_slots"] = int(
+                self.max_slots_spin.get_value()
+            )
+            self.config.save()
+        except Exception:
+            pass
+        ok = self._parent_app.register_global_shortcuts()
+        # Refresh status after a brief delay so the portal handshake has time to
+        # resolve before we read state().
+        GLib.timeout_add(500, lambda: (self._refresh_kde_status_label(), False)[1])
+        if not ok:
             self._kde_status_lbl.set_markup(
-                "<small><span foreground='#cc0000'>kglobalaccel D-Bus service not available — "
-                "global hotkeys disabled.</span></small>"
+                "<small><span foreground='#cc0000'>Portal not available.</span></small>"
+            )
+
+    def _on_unregister_clicked(self, _btn):
+        if self._parent_app is None or self._parent_app._portal is None:
+            return
+        try:
+            self._parent_app._portal.stop()
+        except Exception as e:
+            print(f"[portal] unregister error: {e}")
+        self._refresh_kde_status_label()
+
+    def _refresh_kde_status_label(self):
+        if self._parent_app is None or self._parent_app._portal is None:
+            self._kde_status_lbl.set_markup(
+                "<small><span foreground='#cc0000'>xdg-desktop-portal "
+                "GlobalShortcuts not available — global hotkeys disabled.</span></small>"
             )
             return
-        active = sorted(self._parent_app._kga.active_slots())
-        if active:
-            chars = []
+        state = self._parent_app._portal.state()
+        bound_ids = self._parent_app._portal.bound_ids()
+        if state == "active" and bound_ids:
             bindings = self._parent_app._compute_slot_bindings()
-            for s in active:
-                ch = bindings.get(str(s), {}).get("character_name", "?")
-                chars.append(f"Meta+Shift+{s} → {ch}")
+            entries = []
+            for sid in sorted(bound_ids, key=lambda x: int(x.rsplit("_", 1)[-1])):
+                try:
+                    slot = int(sid.rsplit("_", 1)[-1])
+                except ValueError:
+                    continue
+                ch = bindings.get(str(slot), {}).get("character_name", "?")
+                entries.append(f"Meta+Shift+{slot} → {ch}")
             self._kde_status_lbl.set_markup(
                 "<small><span foreground='#008800'>● Active: "
-                + GLib.markup_escape_text(" · ".join(chars))
+                + GLib.markup_escape_text(" · ".join(entries))
                 + "</span></small>"
+            )
+        elif state.startswith("error"):
+            self._kde_status_lbl.set_markup(
+                f"<small><span foreground='#cc0000'>Portal error: "
+                f"{GLib.markup_escape_text(state)}</span></small>"
             )
         else:
             self._kde_status_lbl.set_markup(
-                "<small>Ready — no EVE clients currently detected.</small>"
+                f"<small>Portal state: {GLib.markup_escape_text(state)} — "
+                "first-time setup may show a permission dialog.</small>"
             )
 
     def save_settings(self):
@@ -2788,10 +3196,14 @@ class SettingsDialog(Gtk.Dialog):
                     slot_assignments[char_name] = slot
             self.config.settings["slot_assignments"] = slot_assignments
 
-        # Save kglobalaccel enable flag from the Hotkeys tab
+        # Save Hotkeys tab settings
         if hasattr(self, "kde_enable_chk"):
             self.config.settings["kde_hotkeys_enabled"] = bool(
                 self.kde_enable_chk.get_active()
+            )
+        if hasattr(self, "max_slots_spin"):
+            self.config.settings["max_hotkey_slots"] = int(
+                self.max_slots_spin.get_value()
             )
 
         self.config.save()
