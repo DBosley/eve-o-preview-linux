@@ -1075,6 +1075,222 @@ class _PortalGlobalShortcuts:
         GLib.idle_add(self._on_pressed, slot)
 
 
+class _ThumbnailItem(Gtk.Box):
+    """One thumbnail inside the ThumbnailDock.
+
+    Mirrors the captured pixbuf from its source ThumbnailWindow (which keeps
+    running the capture pipeline as before but is never shown). Click to
+    activate the underlying EVE client; updates the label when the
+    character name changes.
+    """
+
+    def __init__(self, xid, source_thumb, on_activate, config):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.xid = xid
+        self.source_thumb = source_thumb
+        self.on_activate = on_activate
+        self.config = config
+        self.is_active = False
+        self._poll_id = None
+
+        # Image container with optional active-state CSS border
+        self.frame = Gtk.Frame()
+        self.frame.set_shadow_type(Gtk.ShadowType.NONE)
+        evbox = Gtk.EventBox()
+        evbox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        evbox.connect("button-press-event", self._on_click)
+        self.image = Gtk.Image()
+        w = int(config.settings.get("thumbnail_width", 320))
+        h = int(config.settings.get("thumbnail_height", 200))
+        self.image.set_size_request(w, h)
+        evbox.add(self.image)
+        self.frame.add(evbox)
+        self.pack_start(self.frame, True, True, 0)
+
+        self.label = Gtk.Label()
+        self.label.set_halign(Gtk.Align.CENTER)
+        self.pack_start(self.label, False, False, 0)
+        self.update_label_from_window()
+        self._update_border_style()
+
+        # Mirror the captured frame ~20 Hz; ThumbnailWindow's tick() is the
+        # real capture loop, we just snapshot its current pixbuf.
+        self._poll_id = GLib.timeout_add(50, self._sync_frame)
+
+    def _on_click(self, _widget, event):
+        if event.button == 1:
+            self.on_activate(self.source_thumb.wnck_window)
+        return False
+
+    def _sync_frame(self):
+        try:
+            pb = self.source_thumb.image.get_pixbuf()
+            if pb is not None:
+                self.image.set_from_pixbuf(pb)
+        except Exception:
+            pass
+        return True
+
+    def update_label_from_window(self):
+        raw = self.source_thumb.wnck_window.get_name() or "EVE"
+        if " - " in raw:
+            raw = raw.split(" - ", 1)[1].split("[")[0].strip()
+        self.label.set_markup(f"<b>{GLib.markup_escape_text(raw)}</b>")
+
+    def set_active(self, is_active):
+        self.is_active = is_active
+        self._update_border_style()
+
+    def _update_border_style(self):
+        # 3 px border in active color when active, transparent otherwise.
+        color = self.config.settings.get("active_border_color", "#00FF00")
+        ctx = self.frame.get_style_context()
+        cls = "eve-thumb-active"
+        if not hasattr(_ThumbnailItem, "_css_loaded"):
+            _ThumbnailItem._css_loaded = True
+        # Install a per-widget style provider (cheap; one per item)
+        prov = Gtk.CssProvider()
+        css = f".eve-thumb-active {{ border: 3px solid {color}; }} " \
+              f".eve-thumb-inactive {{ border: 3px solid transparent; }}"
+        try:
+            prov.load_from_data(css.encode("utf-8"))
+            ctx.add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        except Exception:
+            pass
+        if self.is_active:
+            ctx.add_class("eve-thumb-active")
+            ctx.remove_class("eve-thumb-inactive")
+        else:
+            ctx.add_class("eve-thumb-inactive")
+            ctx.remove_class("eve-thumb-active")
+
+    def destroy(self):
+        if self._poll_id is not None:
+            try:
+                GLib.source_remove(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
+        super().destroy()
+
+
+class ThumbnailDock(Gtk.Window):
+    """Single resizable container window for all thumbnails.
+
+    Uses a Gtk.FlowBox so the number of columns adapts automatically as the
+    window is resized. Position and size persist to the app config.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.items = {}    # xid → _ThumbnailItem
+        self._save_timer = None
+
+        self.set_title("EVE-O Thumbnails")
+        self.set_decorated(True)
+        self.set_skip_taskbar_hint(False)
+        self.set_keep_above(bool(self.config.settings.get("always_on_top", True)))
+        try:
+            self.set_opacity(float(self.config.settings.get("opacity", 0.95)))
+        except Exception:
+            pass
+
+        # Restore last size/position
+        size = self.config.settings.get("dock_size") or [680, 260]
+        try:
+            self.set_default_size(int(size[0]), int(size[1]))
+        except Exception:
+            self.set_default_size(680, 260)
+        pos = self.config.settings.get("dock_position")
+        if pos:
+            try:
+                self.move(int(pos[0]), int(pos[1]))
+            except Exception:
+                pass
+
+        self.flow = Gtk.FlowBox()
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_homogeneous(True)
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_min_children_per_line(1)
+        self.flow.set_max_children_per_line(20)
+        self.flow.set_column_spacing(6)
+        self.flow.set_row_spacing(6)
+        self.flow.set_margin_top(6)
+        self.flow.set_margin_bottom(6)
+        self.flow.set_margin_start(6)
+        self.flow.set_margin_end(6)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        scrolled.add(self.flow)
+        self.add(scrolled)
+
+        # Closing dock doesn't quit the app — just hide.
+        self.connect("delete-event", lambda *_: (self.hide(), True)[1])
+        self.connect("configure-event", self._on_configure)
+
+    def _on_configure(self, _w, _ev):
+        # Debounced save of geometry to config.
+        try:
+            x, y = self.get_position()
+            w, h = self.get_size()
+            self.config.settings["dock_position"] = [x, y]
+            self.config.settings["dock_size"] = [w, h]
+        except Exception:
+            return False
+        if self._save_timer is not None:
+            try:
+                GLib.source_remove(self._save_timer)
+            except Exception:
+                pass
+        self._save_timer = GLib.timeout_add(400, self._save_geometry)
+        return False
+
+    def _save_geometry(self):
+        self._save_timer = None
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        return False
+
+    def add_thumb(self, xid, source_thumb, on_activate):
+        if xid in self.items:
+            return self.items[xid]
+        item = _ThumbnailItem(xid, source_thumb, on_activate, self.config)
+        self.items[xid] = item
+        self.flow.add(item)
+        item.show_all()
+        if not self.get_visible():
+            self.show_all()
+        return item
+
+    def remove_thumb(self, xid):
+        item = self.items.pop(xid, None)
+        if item is None:
+            return
+        try:
+            item.destroy()
+        except Exception:
+            pass
+        if not self.items:
+            self.hide()
+
+    def set_active(self, active_xid):
+        for xid, item in self.items.items():
+            item.set_active(xid == active_xid)
+
+    def refresh_labels(self):
+        for item in self.items.values():
+            try:
+                item.update_label_from_window()
+            except Exception:
+                pass
+
+
 class Config:
     def __init__(self):
         from pathlib import Path as _Path
@@ -1100,6 +1316,12 @@ class Config:
             "slot_assignments": {},
             "max_hotkey_slots": 9,
             "kde_hotkeys_enabled": True,
+            # Dock mode: all thumbnails live inside a single resizable window
+            # with a flow layout that adapts row/column count to width. When
+            # off, each thumbnail is its own floating window (legacy behavior).
+            "dock_mode": False,
+            "dock_position": None,
+            "dock_size": [680, 260],
         }
         self.slots_file = self.config_dir / "slots.json"
         self.settings = self.load()
@@ -1144,7 +1366,13 @@ class ThumbnailWindow(Gtk.Window):
         # This guarantees thumbnails appear above every fullscreen/fixed-window
         # surface because the Wayland compositor renders OVERLAY above all managed
         # windows unconditionally, regardless of XWayland stacking tricks.
-        self._use_ls = _LAYER_SHELL_AVAILABLE and _WAYLAND_SESSION
+        # NB: Disabled when the user has dock mode on — the captured pixbuf
+        # then needs to live in self.image so the ThumbnailDock items can
+        # mirror it. (Layer-shell mode ships frames to a subprocess instead.)
+        self._use_ls = (
+            _LAYER_SHELL_AVAILABLE and _WAYLAND_SESSION
+            and not config.settings.get("dock_mode", False)
+        )
         self._ls = None       # _LayerShellDisplay, created after GTK init
         self._ls_x = self._ls_y = 0
 
@@ -1778,8 +2006,22 @@ class EVEOPreview(Gtk.Window):
         self.thumbnails = {}
         self.client_rows = {}        # xid → Gtk.ListBoxRow in the management window
         self._pending_watches = {}   # xid → handler_id for name-changed watchers
+        # Session-only sticky xid → slot map. When an EVE client window is
+        # given a slot (via right-click bind, character preference, or
+        # auto-fill), the assignment stays with that *window* until it
+        # closes — so a character logout/login in the same client preserves
+        # the hotkey binding. Persistent character→slot prefs live in
+        # config.slot_assignments separately.
+        self._session_xid_slots = {}
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()
+
+        # Dock mode: one resizable container for every thumbnail, instead of
+        # nine floating tiny windows. Created lazily so non-dock-mode users
+        # don't pay the construction cost.
+        self._dock = None
+        if self.config.settings.get("dock_mode", False):
+            self._dock = ThumbnailDock(self.config)
 
         # xdg-desktop-portal GlobalShortcuts is the Wayland-native path for
         # third-party processes to bind global hotkeys. The portal client is
@@ -1991,14 +2233,19 @@ class EVEOPreview(Gtk.Window):
         thumb.bind_live(xid, self.config.settings["thumbnail_width"], self.config.settings["thumbnail_height"])
 
         name = window.get_name()
-        pos = self.config.settings.get("thumbnail_positions", {}).get(name)
-        if pos:
-            thumb.move(int(pos[0]), int(pos[1]))
+        if self._dock is not None:
+            # Dock mode — the ThumbnailWindow keeps capturing but is never
+            # shown. A _ThumbnailItem inside the dock mirrors its pixbuf.
+            self._dock.add_thumb(xid, thumb, self._activate_window)
         else:
-            self._place_thumb(thumb)
-        # show_all() after positioning so the layer-shell subprocess receives POS
-        # before the first frame, preventing a visible jump from (0,0).
-        thumb.show_all()
+            pos = self.config.settings.get("thumbnail_positions", {}).get(name)
+            if pos:
+                thumb.move(int(pos[0]), int(pos[1]))
+            else:
+                self._place_thumb(thumb)
+            # show_all() after positioning so the layer-shell subprocess receives POS
+            # before the first frame, preventing a visible jump from (0,0).
+            thumb.show_all()
 
         # Create styled list row
         row = Gtk.ListBoxRow()
@@ -2067,6 +2314,9 @@ class EVEOPreview(Gtk.Window):
                 pass
 
     def _remove_thumb(self, xid):
+        if self._dock is not None:
+            self._dock.remove_thumb(xid)
+
         t = self.thumbnails.pop(xid, None)
         if t:
             t.destroy()
@@ -2074,6 +2324,10 @@ class EVEOPreview(Gtk.Window):
         row = self.client_rows.pop(xid, None)
         if row:
             row.destroy()
+
+        # Window is gone — drop its sticky slot binding so future windows
+        # (or relaunches of EVE) get a fresh assignment.
+        self._session_xid_slots.pop(xid, None)
 
         self._update_status()
         self._write_slots_state()
@@ -2195,6 +2449,8 @@ class EVEOPreview(Gtk.Window):
         return True  # keep repeating
 
     def _apply_active_borders(self, active_xid):
+        if self._dock is not None:
+            self._dock.set_active(active_xid)
         for xid, t in self.thumbnails.items():
             is_active = (xid == active_xid)
 
@@ -2260,46 +2516,85 @@ class EVEOPreview(Gtk.Window):
 
     def _compute_slot_bindings(self):
         """Return {slot_str: {xid_hex, character_name, window_title}} for
-        currently-tracked EVE clients, honoring slot_assignments preferences
-        and filling unassigned characters into the lowest free slot."""
-        assignments = self.config.settings.get("slot_assignments", {}) or {}
+        currently-tracked EVE clients.
+
+        Priority order:
+          1. **Sticky xid binding** — if this window has already been given
+             a slot this session (via right-click, character preference, or
+             auto-fill), keep it. This is what lets a character logout/
+             login *in the same client* preserve the hotkey.
+          2. **Character preference** — for windows without a sticky slot
+             yet, look up the character's preferred slot in the saved
+             ``slot_assignments`` config.
+          3. **Auto-fill** — anything else lands in the lowest free slot.
+
+        Side effects (mutate ``self._session_xid_slots`` and persist
+        character→slot in config so next session remembers a manual bind):
+          - Every assigned xid gets its slot recorded in the session map.
+          - Every assigned character's slot is written to slot_assignments.
+        """
+        saved = dict(self.config.settings.get("slot_assignments", {}) or {})
         max_slots = int(self.config.settings.get("max_hotkey_slots", 9) or 9)
 
-        char_to_xid = {}
+        char_xid_pairs = []
         for xid in self.thumbnails:
             name = self._character_name_for_xid(xid)
             if name:
-                char_to_xid.setdefault(name, xid)
+                char_xid_pairs.append((name, xid))
 
-        bindings = {}
+        bindings = {}      # slot:int → (char_name, xid)
         used = set()
-        unassigned_chars = []
 
-        for char_name, xid in char_to_xid.items():
-            preferred = assignments.get(char_name)
-            try:
-                slot = int(preferred) if preferred else 0
-            except (TypeError, ValueError):
-                slot = 0
-            if 1 <= slot <= max_slots and slot not in used:
-                used.add(slot)
-                bindings[str(slot)] = (char_name, xid)
+        # Phase 1: honor sticky xid bindings from this session.
+        unstuck = []
+        for name, xid in char_xid_pairs:
+            stuck = self._session_xid_slots.get(xid)
+            if isinstance(stuck, int) and 1 <= stuck <= max_slots and stuck not in used:
+                used.add(stuck)
+                bindings[stuck] = (name, xid)
+                saved[name] = stuck     # remember for future sessions
             else:
-                unassigned_chars.append((char_name, xid))
+                unstuck.append((name, xid))
 
+        # Phase 2: apply persisted character preferences for un-stuck windows.
+        leftover = []
+        for name, xid in unstuck:
+            pref = saved.get(name)
+            try:
+                pslot = int(pref) if pref else 0
+            except (TypeError, ValueError):
+                pslot = 0
+            if 1 <= pslot <= max_slots and pslot not in used:
+                used.add(pslot)
+                bindings[pslot] = (name, xid)
+                self._session_xid_slots[xid] = pslot
+            else:
+                leftover.append((name, xid))
+
+        # Phase 3: auto-fill the rest into the lowest free slots.
         next_slot = 1
-        for char_name, xid in unassigned_chars:
+        for name, xid in leftover:
             while next_slot in used and next_slot <= max_slots:
                 next_slot += 1
             if next_slot > max_slots:
                 break
             used.add(next_slot)
-            bindings[str(next_slot)] = (char_name, xid)
+            bindings[next_slot] = (name, xid)
+            self._session_xid_slots[xid] = next_slot
+            saved[name] = next_slot
+
+        # Persist any new character→slot mappings discovered.
+        if saved != (self.config.settings.get("slot_assignments", {}) or {}):
+            self.config.settings["slot_assignments"] = saved
+            try:
+                self.config.save()
+            except Exception:
+                pass
 
         out = {}
-        for slot_str, (char_name, xid) in bindings.items():
+        for slot, (char_name, xid) in bindings.items():
             wnck_w = self.thumbnails[xid].wnck_window
-            out[slot_str] = {
+            out[str(slot)] = {
                 "xid": f"0x{xid:08x}",
                 "character_name": char_name,
                 "window_title": wnck_w.get_name() or "",
@@ -2459,20 +2754,42 @@ class EVEOPreview(Gtk.Window):
 
     def _set_character_slot(self, char_name, slot):
         """Bind a character to a specific slot (0 = unset). Clears any other
-        character that was claiming that slot, so right-click reassignments
-        produce intuitive single-active-per-slot results."""
+        character/window that was claiming that slot, so right-click
+        reassignments produce intuitive single-active-per-slot results.
+
+        Also updates the session xid map so the binding sticks to the
+        character's *current window* — meaning a character swap in that
+        same client will inherit this slot.
+        """
         assignments = dict(self.config.settings.get("slot_assignments", {}) or {})
+
+        # Find the xid currently displaying char_name (if any).
+        target_xid = None
+        for xid in self.thumbnails:
+            if self._character_name_for_xid(xid) == char_name:
+                target_xid = xid
+                break
+
         if slot > 0:
-            # Evict any other char currently assigned to this slot.
+            # Evict any other char/xid currently claiming this slot.
             for other, other_slot in list(assignments.items()):
                 try:
                     if int(other_slot) == int(slot) and other != char_name:
                         assignments.pop(other, None)
                 except (TypeError, ValueError):
                     pass
+            for ev_xid, ev_slot in list(self._session_xid_slots.items()):
+                if ev_slot == int(slot) and ev_xid != target_xid:
+                    self._session_xid_slots.pop(ev_xid, None)
+
             assignments[char_name] = int(slot)
+            if target_xid is not None:
+                self._session_xid_slots[target_xid] = int(slot)
         else:
             assignments.pop(char_name, None)
+            if target_xid is not None:
+                self._session_xid_slots.pop(target_xid, None)
+
         self.config.settings["slot_assignments"] = assignments
         self.config.save()
         self._write_slots_state()
@@ -2825,6 +3142,17 @@ class SettingsDialog(Gtk.Dialog):
         self.show_overlay = Gtk.CheckButton(label="Show character name overlay")
         self.show_overlay.set_active(self.config.settings["show_overlay"])
         behavior_box.pack_start(self.show_overlay, False, False, 0)
+
+        self.dock_mode = Gtk.CheckButton(
+            label="Dock mode — all thumbnails in one resizable window"
+        )
+        self.dock_mode.set_active(bool(self.config.settings.get("dock_mode", False)))
+        self.dock_mode.set_tooltip_text(
+            "When on, all thumbnails are grouped into a single container "
+            "window that can be moved and resized. Column count adapts to "
+            "width. Takes effect after restart."
+        )
+        behavior_box.pack_start(self.dock_mode, False, False, 0)
 
         vbox.pack_start(behavior_box, False, False, 0)
 
@@ -3195,6 +3523,9 @@ class SettingsDialog(Gtk.Dialog):
                 else:
                     slot_assignments[char_name] = slot
             self.config.settings["slot_assignments"] = slot_assignments
+
+        if hasattr(self, "dock_mode"):
+            self.config.settings["dock_mode"] = bool(self.dock_mode.get_active())
 
         # Save Hotkeys tab settings
         if hasattr(self, "kde_enable_chk"):
