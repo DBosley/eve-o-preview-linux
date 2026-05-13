@@ -766,6 +766,155 @@ def is_eve_window_steamaware(wnck_window):
         return True
     return False
 
+class _KGlobalAccel:
+    """In-process KDE Plasma global-shortcut binding for EVE slot keys.
+
+    Registers Meta+N actions with the org.kde.kglobalaccel D-Bus service on
+    demand and tears them down when the corresponding EVE client disappears
+    or when the app exits. Subscribes to ``globalShortcutPressed`` and calls
+    ``on_pressed(slot:int)`` from inside the GTK main loop.
+
+    Designed to fail gracefully on non-KDE desktops — the service simply will
+    not be exported, ``__init__`` will raise, and the caller is expected to
+    swallow the exception and continue in degraded mode.
+    """
+
+    COMPONENT_UNIQUE = "eve-o-preview"
+    COMPONENT_FRIENDLY = "EVE-O Preview"
+
+    # Qt constants — kglobalaccel expects (Qt::Key | Qt::Modifier) ints.
+    META_MODIFIER = 0x10000000     # Qt::MetaModifier
+    SHIFT_MODIFIER = 0x02000000    # Qt::ShiftModifier
+    CTRL_MODIFIER = 0x04000000     # Qt::ControlModifier
+    ALT_MODIFIER = 0x08000000      # Qt::AltModifier
+    KEY_0 = 0x30                   # Qt::Key_0 ; Key_N = 0x30 + N
+
+    # Default modifier combo for slot keys. Plasma reserves plain Meta+1..9
+    # for "Activate Task Manager Entry N"; Meta+Shift+N is uncontested by
+    # default and stays muscle-memory-adjacent.
+    DEFAULT_MODIFIER = META_MODIFIER | SHIFT_MODIFIER
+
+    # SetShortcut flags (from kglobalaccel_interface.h)
+    FLAG_SET_PRESENT = 0x2
+    FLAG_NO_AUTOLOADING = 0x4
+
+    def __init__(self, on_pressed):
+        from gi.repository import Gio as _Gio
+        self._Gio = _Gio
+        self._on_pressed = on_pressed
+        self._registered = {}  # slot:int → action_id:tuple(str×4)
+        self._subscription_id = None
+
+        # Will raise if the service isn't reachable — caller handles.
+        self._bus = _Gio.bus_get_sync(_Gio.BusType.SESSION, None)
+        # Probe the service so we fail fast on non-KDE setups.
+        self._bus.call_sync(
+            "org.kde.kglobalaccel", "/kglobalaccel",
+            "org.freedesktop.DBus.Peer", "Ping",
+            None, None, _Gio.DBusCallFlags.NONE, 2000, None,
+        )
+
+    def start(self):
+        """Begin listening for shortcut-press signals on our component."""
+        if self._subscription_id is not None:
+            return
+        path = f"/component/{self.COMPONENT_UNIQUE}"
+        self._subscription_id = self._bus.signal_subscribe(
+            "org.kde.kglobalaccel",
+            "org.kde.kglobalaccel.Component",
+            "globalShortcutPressed",
+            path,
+            None,
+            self._Gio.DBusSignalFlags.NONE,
+            self._on_signal,
+        )
+
+    def stop(self):
+        if self._subscription_id is not None:
+            try:
+                self._bus.signal_unsubscribe(self._subscription_id)
+            except Exception:
+                pass
+            self._subscription_id = None
+
+    def _on_signal(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            component_unique, action_unique, _timestamp = params.unpack()
+        except Exception:
+            return
+        if component_unique != self.COMPONENT_UNIQUE:
+            return
+        if not action_unique.startswith("switch_slot_"):
+            return
+        try:
+            slot = int(action_unique.rsplit("_", 1)[-1])
+        except ValueError:
+            return
+        # Dispatch from the GTK main loop to keep all window manipulation on
+        # the main thread (D-Bus signals can arrive on the bus thread).
+        GLib.idle_add(self._on_pressed, slot)
+
+    def _action_id(self, slot):
+        slot_str = str(slot)
+        return [
+            self.COMPONENT_UNIQUE,
+            f"switch_slot_{slot_str}",
+            self.COMPONENT_FRIENDLY,
+            f"Switch to EVE slot {slot_str}",
+        ]
+
+    def _qt_key_for_slot(self, slot):
+        # slot 10 conceptually maps to digit 0; we expect slots 1..9 in practice.
+        digit = slot if slot != 10 else 0
+        return self.DEFAULT_MODIFIER | (self.KEY_0 + digit)
+
+    def register_slot(self, slot):
+        """Idempotent: register Meta+slot if not already registered."""
+        if slot in self._registered:
+            return
+        action_id = self._action_id(slot)
+        try:
+            self._bus.call_sync(
+                "org.kde.kglobalaccel", "/kglobalaccel",
+                "org.kde.KGlobalAccel", "doRegister",
+                GLib.Variant("(as)", (action_id,)),
+                None, self._Gio.DBusCallFlags.NONE, 3000, None,
+            )
+            keys = [self._qt_key_for_slot(slot)]
+            self._bus.call_sync(
+                "org.kde.kglobalaccel", "/kglobalaccel",
+                "org.kde.KGlobalAccel", "setShortcut",
+                GLib.Variant("(asaiu)",
+                             (action_id, keys,
+                              self.FLAG_SET_PRESENT | self.FLAG_NO_AUTOLOADING)),
+                None, self._Gio.DBusCallFlags.NONE, 3000, None,
+            )
+            self._registered[slot] = tuple(action_id)
+        except Exception as e:
+            print(f"[kga] register slot {slot} failed: {e}")
+
+    def unregister_slot(self, slot):
+        action_id = self._registered.pop(slot, None)
+        if action_id is None:
+            return
+        try:
+            self._bus.call_sync(
+                "org.kde.kglobalaccel", "/kglobalaccel",
+                "org.kde.KGlobalAccel", "unRegister",
+                GLib.Variant("(as)", (list(action_id),)),
+                None, self._Gio.DBusCallFlags.NONE, 3000, None,
+            )
+        except Exception as e:
+            print(f"[kga] unregister slot {slot} failed: {e}")
+
+    def unregister_all(self):
+        for slot in list(self._registered.keys()):
+            self.unregister_slot(slot)
+
+    def active_slots(self):
+        return list(self._registered.keys())
+
+
 class Config:
     def __init__(self):
         from pathlib import Path as _Path
@@ -783,8 +932,16 @@ class Config:
             "show_overlay": True,
             "refresh_fps": 10,  # FPS instead of period
             "active_border_color": "#00FF00",  # Neon green default
-            "thumbnail_positions": {}
+            "thumbnail_positions": {},
+            # Hotkey slot assignment: maps character_name → preferred slot int (1-9).
+            # When enabled, the app registers Meta+<slot> via kglobalaccel when
+            # each EVE client appears and unregisters on close/exit. The slots.json
+            # state file is still written for use by external tools like eve-switch.
+            "slot_assignments": {},
+            "max_hotkey_slots": 9,
+            "kde_hotkeys_enabled": True,
         }
+        self.slots_file = self.config_dir / "slots.json"
         self.settings = self.load()
 
     def load(self):
@@ -1464,6 +1621,17 @@ class EVEOPreview(Gtk.Window):
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()
 
+        # In-process KDE global-shortcut binder. Optional: silently disabled
+        # on non-KDE setups or if the user has turned it off in settings.
+        self._kga = None
+        if self.config.settings.get("kde_hotkeys_enabled", True):
+            try:
+                self._kga = _KGlobalAccel(on_pressed=self._on_hotkey_pressed)
+                self._kga.start()
+            except Exception as e:
+                print(f"[kga] disabled: {e}")
+                self._kga = None
+
         self.set_title("EVE-O Preview")
         self.set_default_size(500, 400)
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -1671,10 +1839,14 @@ class EVEOPreview(Gtk.Window):
             if " - " in raw:
                 display = raw.split(" - ", 1)[1].split("[")[0].strip()
             label.set_text(display)
+            # Title change can mean a different character logged in on the
+            # same client window — re-emit slots.json with the new name.
+            self._write_slots_state()
         window.connect("name-changed", _refresh_row_label)
         _refresh_row_label()
 
         self._update_status()
+        self._write_slots_state()
 
     def _remove_thumb(self, xid):
         t = self.thumbnails.pop(xid, None)
@@ -1686,6 +1858,7 @@ class EVEOPreview(Gtk.Window):
             row.destroy()
 
         self._update_status()
+        self._write_slots_state()
 
     def _on_window_opened(self, _screen, window):
         if not self._check_and_add(window):
@@ -1846,6 +2019,146 @@ class EVEOPreview(Gtk.Window):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Hotkey slot binding
+    # ------------------------------------------------------------------
+    # The running app maintains a JSON file at config_dir/slots.json mapping
+    # slot numbers (as strings, "1"–"9") to current EVE clients. The
+    # companion eve-switch script reads this file and activates the bound
+    # window. KDE custom shortcuts (Meta+1, Meta+2, …) call eve-switch — so
+    # the hotkey bindings themselves are static while their *targets* update
+    # dynamically as clients open and close.
+    def _character_name_for_xid(self, xid):
+        thumb = self.thumbnails.get(xid)
+        if not thumb:
+            return None
+        raw = thumb.wnck_window.get_name() or ""
+        if " - " in raw:
+            name = raw.split(" - ", 1)[1]
+            if "[" in name:
+                name = name.split("[")[0]
+            return name.strip()
+        return raw.strip() or None
+
+    def _compute_slot_bindings(self):
+        """Return {slot_str: {xid_hex, character_name, window_title}} for
+        currently-tracked EVE clients, honoring slot_assignments preferences
+        and filling unassigned characters into the lowest free slot."""
+        assignments = self.config.settings.get("slot_assignments", {}) or {}
+        max_slots = int(self.config.settings.get("max_hotkey_slots", 9) or 9)
+
+        char_to_xid = {}
+        for xid in self.thumbnails:
+            name = self._character_name_for_xid(xid)
+            if name:
+                char_to_xid.setdefault(name, xid)
+
+        bindings = {}
+        used = set()
+        unassigned_chars = []
+
+        for char_name, xid in char_to_xid.items():
+            preferred = assignments.get(char_name)
+            try:
+                slot = int(preferred) if preferred else 0
+            except (TypeError, ValueError):
+                slot = 0
+            if 1 <= slot <= max_slots and slot not in used:
+                used.add(slot)
+                bindings[str(slot)] = (char_name, xid)
+            else:
+                unassigned_chars.append((char_name, xid))
+
+        next_slot = 1
+        for char_name, xid in unassigned_chars:
+            while next_slot in used and next_slot <= max_slots:
+                next_slot += 1
+            if next_slot > max_slots:
+                break
+            used.add(next_slot)
+            bindings[str(next_slot)] = (char_name, xid)
+
+        out = {}
+        for slot_str, (char_name, xid) in bindings.items():
+            wnck_w = self.thumbnails[xid].wnck_window
+            out[slot_str] = {
+                "xid": f"0x{xid:08x}",
+                "character_name": char_name,
+                "window_title": wnck_w.get_name() or "",
+            }
+        return out
+
+    def _write_slots_state(self):
+        """Recompute current slot→client bindings, atomically write the
+        state file, and reconcile kglobalaccel registrations to match."""
+        try:
+            bindings = self._compute_slot_bindings()
+            state = {
+                "slots": bindings,
+                "max_slots": int(self.config.settings.get("max_hotkey_slots", 9) or 9),
+            }
+            path = self.config.slots_file
+            existing = None
+            try:
+                if path.exists():
+                    existing = json.loads(path.read_text())
+            except Exception:
+                existing = None
+            if existing != state:
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(state, indent=2))
+                tmp.replace(path)
+        except Exception as e:
+            print(f"[slots] write error: {e}")
+            bindings = {}
+
+        # Reconcile kglobalaccel: register newly-bound slots, unregister freed ones.
+        if self._kga is not None and self.config.settings.get("kde_hotkeys_enabled", True):
+            try:
+                desired = {int(s) for s in bindings.keys()}
+                active = set(self._kga.active_slots())
+                for slot in active - desired:
+                    self._kga.unregister_slot(slot)
+                for slot in desired - active:
+                    self._kga.register_slot(slot)
+            except Exception as e:
+                print(f"[kga] reconcile error: {e}")
+        elif self._kga is not None:
+            # User disabled hotkeys — drop everything we currently hold.
+            try:
+                self._kga.unregister_all()
+            except Exception as e:
+                print(f"[kga] disable cleanup error: {e}")
+
+    def _on_hotkey_pressed(self, slot):
+        """kglobalaccel callback: activate the EVE window bound to ``slot``."""
+        try:
+            bindings = self._compute_slot_bindings()
+            entry = bindings.get(str(slot))
+            if not entry:
+                return False
+            target_xid_hex = entry.get("xid", "")
+            try:
+                target_xid = int(target_xid_hex, 16)
+            except (TypeError, ValueError):
+                return False
+            thumb = self.thumbnails.get(target_xid)
+            if thumb is None:
+                return False
+            self._activate_window(thumb.wnck_window)
+        except Exception as e:
+            print(f"[kga] press handler error: {e}")
+        return False  # one-shot idle callback
+
+    def shutdown_hotkeys(self):
+        """Tear down all kglobalaccel registrations. Called from main() on exit."""
+        if self._kga is not None:
+            try:
+                self._kga.unregister_all()
+                self._kga.stop()
+            except Exception as e:
+                print(f"[kga] shutdown error: {e}")
+
     def _show_settings(self, _btn):
         dialog = SettingsDialog(self, self.config)
         if dialog.run() == Gtk.ResponseType.OK:
@@ -1886,7 +2199,9 @@ class SettingsDialog(Gtk.Dialog):
     def __init__(self, parent, config):
         super().__init__(title="Settings", parent=parent, flags=0)
         self.config = config
-        self.set_default_size(480, 520)
+        self._parent_app = parent   # EVEOPreview — used by Hotkeys tab
+        self._slot_widgets = {}     # character_name → Gtk.SpinButton
+        self.set_default_size(520, 560)
         self.set_resizable(False)
 
         # Header bar for dialog
@@ -1926,6 +2241,10 @@ class SettingsDialog(Gtk.Dialog):
         # Behavior settings page
         behavior_page = self._create_behavior_page()
         notebook.append_page(behavior_page, Gtk.Label(label="Behavior"))
+
+        # Hotkeys / slot assignment page
+        hotkeys_page = self._create_hotkeys_page()
+        notebook.append_page(hotkeys_page, Gtk.Label(label="Hotkeys"))
 
         self.show_all()
 
@@ -2268,6 +2587,166 @@ class SettingsDialog(Gtk.Dialog):
 
         return vbox
 
+    def _create_hotkeys_page(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox.set_margin_start(15)
+        vbox.set_margin_end(15)
+        vbox.set_margin_top(15)
+        vbox.set_margin_bottom(15)
+
+        intro = Gtk.Label()
+        intro.set_markup(
+            "Assign each character to a hotkey slot. KDE custom shortcuts call "
+            "<tt>eve-switch &lt;N&gt;</tt>, which activates the currently-bound "
+            "window for that slot. <b>0</b> = auto (lowest free slot)."
+        )
+        intro.set_line_wrap(True)
+        intro.set_xalign(0)
+        intro.set_margin_bottom(12)
+        vbox.pack_start(intro, False, False, 0)
+
+        section = Gtk.Label(label="Detected Characters")
+        section.set_halign(Gtk.Align.START)
+        section.get_style_context().add_class("section-title")
+        vbox.pack_start(section, False, False, 0)
+
+        # Gather every character we know about: currently-tracked clients
+        # union with already-saved preferred-slot characters (so the meatbag
+        # can pre-assign offline alts).
+        live_chars = {}
+        if self._parent_app is not None:
+            for xid in list(self._parent_app.thumbnails.keys()):
+                name = self._parent_app._character_name_for_xid(xid)
+                if name:
+                    live_chars[name] = True
+        saved = self.config.settings.get("slot_assignments", {}) or {}
+        all_chars = sorted(set(list(live_chars.keys()) + list(saved.keys())))
+
+        if not all_chars:
+            empty = Gtk.Label(label="(No EVE characters detected yet — log in and reopen settings.)")
+            empty.set_xalign(0)
+            empty.set_margin_start(8)
+            empty.set_margin_top(4)
+            empty.set_margin_bottom(12)
+            vbox.pack_start(empty, False, False, 0)
+        else:
+            grid = Gtk.Grid()
+            grid.set_column_spacing(12)
+            grid.set_row_spacing(6)
+            grid.set_margin_start(8)
+            grid.set_margin_bottom(12)
+
+            hdr_char = Gtk.Label()
+            hdr_char.set_markup("<b>Character</b>")
+            hdr_char.set_xalign(0)
+            hdr_slot = Gtk.Label()
+            hdr_slot.set_markup("<b>Slot</b>")
+            hdr_slot.set_xalign(0)
+            hdr_live = Gtk.Label()
+            hdr_live.set_markup("<b>Status</b>")
+            hdr_live.set_xalign(0)
+            grid.attach(hdr_char, 0, 0, 1, 1)
+            grid.attach(hdr_slot, 1, 0, 1, 1)
+            grid.attach(hdr_live, 2, 0, 1, 1)
+
+            max_slots = int(self.config.settings.get("max_hotkey_slots", 9) or 9)
+            for row, char_name in enumerate(all_chars, start=1):
+                name_lbl = Gtk.Label(label=char_name)
+                name_lbl.set_xalign(0)
+                grid.attach(name_lbl, 0, row, 1, 1)
+
+                spin = Gtk.SpinButton()
+                spin.set_range(0, max_slots)
+                spin.set_increments(1, 1)
+                try:
+                    spin.set_value(int(saved.get(char_name, 0) or 0))
+                except (TypeError, ValueError):
+                    spin.set_value(0)
+                grid.attach(spin, 1, row, 1, 1)
+                self._slot_widgets[char_name] = spin
+
+                status = Gtk.Label(label="● online" if char_name in live_chars else "○ offline")
+                status.set_xalign(0)
+                grid.attach(status, 2, row, 1, 1)
+
+            vbox.pack_start(grid, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(8)
+        sep.set_margin_bottom(8)
+        vbox.pack_start(sep, False, False, 0)
+
+        # In-process kglobalaccel registration status
+        kde_label = Gtk.Label(label="KDE Global Shortcuts")
+        kde_label.set_halign(Gtk.Align.START)
+        kde_label.get_style_context().add_class("section-title")
+        vbox.pack_start(kde_label, False, False, 0)
+
+        self.kde_enable_chk = Gtk.CheckButton(
+            label="Enable Meta+Shift+1…Meta+Shift+N for detected EVE clients"
+        )
+        self.kde_enable_chk.set_active(
+            bool(self.config.settings.get("kde_hotkeys_enabled", True))
+        )
+        self.kde_enable_chk.set_margin_start(8)
+        vbox.pack_start(self.kde_enable_chk, False, False, 0)
+
+        kde_hint = Gtk.Label()
+        kde_hint.set_markup(
+            "<small>Bindings are registered when each client is detected and removed "
+            "when the client closes or this app exits. No setup needed — the registration "
+            "happens automatically via the kglobalaccel D-Bus service.</small>"
+        )
+        kde_hint.set_line_wrap(True)
+        kde_hint.set_xalign(0)
+        kde_hint.set_margin_start(8)
+        kde_hint.set_margin_top(2)
+        kde_hint.set_margin_bottom(6)
+        vbox.pack_start(kde_hint, False, False, 0)
+
+        self._kde_status_lbl = Gtk.Label()
+        self._kde_status_lbl.set_xalign(0)
+        self._kde_status_lbl.set_margin_start(8)
+        self._refresh_kde_status_label()
+        vbox.pack_start(self._kde_status_lbl, False, False, 0)
+
+        # Show path to slots.json (helps debugging external integrations)
+        try:
+            slots_path = str(self.config.slots_file)
+        except Exception:
+            slots_path = "~/.config/eve-o-preview-linux/slots.json"
+        path_lbl = Gtk.Label()
+        path_lbl.set_markup(f"<small>State file: <tt>{slots_path}</tt></small>")
+        path_lbl.set_xalign(0)
+        path_lbl.set_margin_top(12)
+        vbox.pack_end(path_lbl, False, False, 0)
+
+        return vbox
+
+    def _refresh_kde_status_label(self):
+        if self._parent_app is None or self._parent_app._kga is None:
+            self._kde_status_lbl.set_markup(
+                "<small><span foreground='#cc0000'>kglobalaccel D-Bus service not available — "
+                "global hotkeys disabled.</span></small>"
+            )
+            return
+        active = sorted(self._parent_app._kga.active_slots())
+        if active:
+            chars = []
+            bindings = self._parent_app._compute_slot_bindings()
+            for s in active:
+                ch = bindings.get(str(s), {}).get("character_name", "?")
+                chars.append(f"Meta+Shift+{s} → {ch}")
+            self._kde_status_lbl.set_markup(
+                "<small><span foreground='#008800'>● Active: "
+                + GLib.markup_escape_text(" · ".join(chars))
+                + "</span></small>"
+            )
+        else:
+            self._kde_status_lbl.set_markup(
+                "<small>Ready — no EVE clients currently detected.</small>"
+            )
+
     def save_settings(self):
         self.config.settings["thumbnail_width"] = int(self.w_spin.get_value())
         self.config.settings["thumbnail_height"] = int(self.h_spin.get_value())
@@ -2293,7 +2772,38 @@ class SettingsDialog(Gtk.Dialog):
         elif self.fps_30.get_active():
             self.config.settings["refresh_fps"] = 30
 
+        # Save slot assignments from the Hotkeys tab. A slot of 0 means
+        # "auto-pick lowest free slot" — store as 0 so absence vs unassigned
+        # is unambiguous when displayed next time.
+        if self._slot_widgets:
+            slot_assignments = dict(self.config.settings.get("slot_assignments", {}) or {})
+            for char_name, spin in self._slot_widgets.items():
+                try:
+                    slot = int(spin.get_value())
+                except (TypeError, ValueError):
+                    slot = 0
+                if slot <= 0:
+                    slot_assignments.pop(char_name, None)
+                else:
+                    slot_assignments[char_name] = slot
+            self.config.settings["slot_assignments"] = slot_assignments
+
+        # Save kglobalaccel enable flag from the Hotkeys tab
+        if hasattr(self, "kde_enable_chk"):
+            self.config.settings["kde_hotkeys_enabled"] = bool(
+                self.kde_enable_chk.get_active()
+            )
+
         self.config.save()
+
+        # Re-emit slots.json AND reconcile kglobalaccel registrations.
+        # _write_slots_state() handles both: it computes the current
+        # bindings and the registration set in one pass.
+        if self._parent_app is not None:
+            try:
+                self._parent_app._write_slots_state()
+            except Exception as e:
+                print(f"[slots] post-save rewrite error: {e}")
 
 def main():
     screen = Wnck.Screen.get_default()
@@ -2309,7 +2819,23 @@ def main():
     # Closing the management window exits the application. Future optional
     # close-to-tray behavior should be handled by a tray setting instead of
     # overriding the close button unconditionally.
-    app.connect("destroy", Gtk.main_quit)
+    def _on_destroy(_w):
+        app.shutdown_hotkeys()
+        Gtk.main_quit()
+    app.connect("destroy", _on_destroy)
+    # Also catch SIGINT/SIGTERM so kglobalaccel registrations don't leak
+    # when the user kills the process from the terminal.
+    import signal as _signal
+    def _on_signal(_signum, _frame):
+        try:
+            app.shutdown_hotkeys()
+        finally:
+            Gtk.main_quit()
+    for _sig in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            _signal.signal(_sig, _on_signal)
+        except Exception:
+            pass
 
     # Re-assert keep-above whenever the management window is (re-)mapped —
     # e.g. after un-minimising from the taskbar.  This ensures it appears

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# eve-switch: activate the EVE Online client bound to a slot.
+#
+# Reads ~/.config/eve-o-preview-linux/slots.json (written live by
+# eve_o_preview_linux.py) and activates the window for the requested slot.
+#
+# Usage: eve-switch <slot>     (e.g. eve-switch 1)
+#
+# Designed to be the target of KDE custom shortcuts. Falls back from wmctrl
+# to xdotool and finally a desktop notification on failure.
+
+set -u
+
+SLOT="${1:-}"
+STATE_FILE="${EVE_PREVIEW_SLOTS_FILE:-$HOME/.config/eve-o-preview-linux/slots.json}"
+
+notify() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a "eve-switch" -t 2500 "EVE Switch" "$1" || true
+    fi
+    printf '%s\n' "$1" >&2
+}
+
+if [[ -z "${SLOT}" ]]; then
+    notify "Usage: eve-switch <slot> (1-9)"
+    exit 2
+fi
+
+if ! [[ "${SLOT}" =~ ^[1-9]$ ]]; then
+    notify "Invalid slot '${SLOT}' (expected 1-9)"
+    exit 2
+fi
+
+if [[ ! -r "${STATE_FILE}" ]]; then
+    notify "Slot state file not found: ${STATE_FILE}"
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    notify "jq required but not installed (pacman -S jq)"
+    exit 1
+fi
+
+XID=$(jq -r --arg s "${SLOT}" '.slots[$s].xid // empty' "${STATE_FILE}" 2>/dev/null || true)
+CHAR=$(jq -r --arg s "${SLOT}" '.slots[$s].character_name // empty' "${STATE_FILE}" 2>/dev/null || true)
+
+if [[ -z "${XID}" ]]; then
+    notify "No EVE client bound to slot ${SLOT}"
+    exit 1
+fi
+
+# wmctrl is the most reliable activator on KDE/XWayland. Use -i for hex xid.
+if command -v wmctrl >/dev/null 2>&1; then
+    if wmctrl -ia "${XID}" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+# Fallback: xdotool. Needs decimal xid.
+if command -v xdotool >/dev/null 2>&1; then
+    DEC_XID=$(printf '%d' "${XID}" 2>/dev/null || echo "")
+    if [[ -n "${DEC_XID}" ]] && xdotool windowactivate --sync "${DEC_XID}" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+notify "Failed to activate slot ${SLOT} (${CHAR:-unknown})"
+exit 1
