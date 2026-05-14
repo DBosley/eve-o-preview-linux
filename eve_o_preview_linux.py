@@ -1066,13 +1066,7 @@ class _PortalGlobalShortcuts:
             return
         if self._session_handle is not None and session_handle != self._session_handle:
             return  # different session — not for us
-        if not shortcut_id.startswith("switch_slot_"):
-            return
-        try:
-            slot = int(shortcut_id.rsplit("_", 1)[-1])
-        except ValueError:
-            return
-        GLib.idle_add(self._on_pressed, slot)
+        GLib.idle_add(self._on_pressed, shortcut_id)
 
 
 class _ThumbnailItem(Gtk.Box):
@@ -2188,6 +2182,12 @@ class EVEOPreview(Gtk.Window):
                 f"EVE Online — Activate slot {slot}",
                 f"Ctrl+Shift+{slot}",
             ))
+        # Bonus shortcut: cycle through bound EVE clients in slot order.
+        desired.append((
+            "next_window",
+            "EVE Online — Cycle to next bound client",
+            "Ctrl+Shift+Space",
+        ))
         self._portal.set_desired_shortcuts(desired)
         # If a session already exists, rebind (re-prompts the user); otherwise
         # do the full CreateSession + BindShortcuts handshake.
@@ -2685,8 +2685,10 @@ class EVEOPreview(Gtk.Window):
             except Exception as e:
                 print(f"[portal] disable cleanup error: {e}")
 
-    def _on_hotkey_pressed(self, slot):
-        """kglobalaccel callback: activate the EVE window bound to ``slot``.
+    def _on_hotkey_pressed(self, shortcut_id):
+        """Portal Activated callback. ``shortcut_id`` is either
+        ``switch_slot_N`` for a direct slot binding or ``next_window`` for
+        the cycle-through binding.
 
         Uses the same activation cascade the thumbnail click path uses
         (wmctrl → xdotool → Xlib → Wnck) because plain Wnck.activate from a
@@ -2696,9 +2698,25 @@ class EVEOPreview(Gtk.Window):
         import subprocess
         try:
             bindings = self._compute_slot_bindings()
-            entry = bindings.get(str(slot))
+
+            # Resolve the target slot.
+            if shortcut_id == "next_window":
+                target_slot = self._next_slot_in_cycle(bindings)
+                if target_slot is None:
+                    print("[portal] next_window: no bound clients")
+                    return False
+                entry = bindings.get(str(target_slot))
+            elif shortcut_id.startswith("switch_slot_"):
+                try:
+                    target_slot = int(shortcut_id.rsplit("_", 1)[-1])
+                except ValueError:
+                    return False
+                entry = bindings.get(str(target_slot))
+            else:
+                return False
+
             if not entry:
-                print(f"[kga] slot {slot} not bound — ignored")
+                print(f"[portal] {shortcut_id}: no client bound")
                 return False
             target_xid_hex = entry.get("xid", "")
             try:
@@ -2753,11 +2771,47 @@ class EVEOPreview(Gtk.Window):
                 except Exception:
                     pass
 
-            print(f"[kga] slot {slot} ({entry.get('character_name','?')}) "
+            print(f"[portal] {shortcut_id} → slot {target_slot} "
+                  f"({entry.get('character_name','?')}) "
                   f"activated via {'wmctrl' if ok else 'fallback'}")
         except Exception as e:
-            print(f"[kga] press handler error: {e}")
+            print(f"[portal] press handler error: {e}")
         return False  # one-shot idle callback
+
+    def _next_slot_in_cycle(self, bindings):
+        """Pick the slot to switch to when Ctrl+Shift+Space is pressed.
+
+        Determines the currently-active EVE client (by Wnck's active-window
+        XID) and returns the next slot in ascending order, wrapping around.
+        Returns None when no slots are bound.
+        """
+        if not bindings:
+            return None
+        try:
+            active_xid = None
+            aw = self.screen.get_active_window()
+            if aw:
+                active_xid = aw.get_xid()
+        except Exception:
+            active_xid = None
+
+        slots_sorted = sorted(int(s) for s in bindings.keys())
+        if not slots_sorted:
+            return None
+
+        active_slot = None
+        for s in slots_sorted:
+            try:
+                if int(bindings[str(s)]["xid"], 16) == active_xid:
+                    active_slot = s
+                    break
+            except (TypeError, ValueError, KeyError):
+                continue
+
+        if active_slot is None:
+            return slots_sorted[0]
+        idx = slots_sorted.index(active_slot)
+        return slots_sorted[(idx + 1) % len(slots_sorted)]
 
     def _on_client_row_button(self, widget, event, wnck_window):
         """Right-click on a client row: pop up a menu to bind it to a slot."""
