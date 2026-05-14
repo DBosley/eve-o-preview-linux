@@ -2186,7 +2186,7 @@ class EVEOPreview(Gtk.Window):
             desired.append((
                 f"switch_slot_{slot}",
                 f"EVE Online — Activate slot {slot}",
-                f"Meta+Shift+{slot}",
+                f"Ctrl+Shift+{slot}",
             ))
         self._portal.set_desired_shortcuts(desired)
         # If a session already exists, rebind (re-prompts the user); otherwise
@@ -2779,7 +2779,7 @@ class EVEOPreview(Gtk.Window):
         menu.append(Gtk.SeparatorMenuItem())
 
         for slot in range(1, max_slots + 1):
-            lbl = f"Slot {slot}  (Meta+Shift+{slot})"
+            lbl = f"Slot {slot}  (Ctrl+Shift+{slot})"
             if current == slot:
                 lbl = f"● {lbl}"
             item = Gtk.MenuItem(label=lbl)
@@ -3416,7 +3416,7 @@ class SettingsDialog(Gtk.Dialog):
             int(self.config.settings.get("max_hotkey_slots", 9) or 9)
         )
         slots_row.pack_start(self.max_slots_spin, False, False, 0)
-        slots_unit = Gtk.Label(label="(Meta+Shift+1 through Meta+Shift+N)")
+        slots_unit = Gtk.Label(label="(Ctrl+Shift+1 through Ctrl+Shift+N)")
         slots_unit.set_xalign(0)
         slots_row.pack_start(slots_unit, True, True, 0)
         vbox.pack_start(slots_row, False, False, 0)
@@ -3424,7 +3424,7 @@ class SettingsDialog(Gtk.Dialog):
         kde_hint = Gtk.Label()
         kde_hint.set_markup(
             "<small>Click <i>Register Shortcuts</i> to open the permission "
-            "dialog. After approval, Meta+Shift+1…N activate whichever EVE "
+            "dialog. After approval, Ctrl+Shift+1…N activate whichever EVE "
             "client is currently bound to each slot. The slot→character "
             "mapping updates live as clients open and close.</small>"
         )
@@ -3514,7 +3514,7 @@ class SettingsDialog(Gtk.Dialog):
                 except ValueError:
                     continue
                 ch = bindings.get(str(slot), {}).get("character_name", "?")
-                entries.append(f"Meta+Shift+{slot} → {ch}")
+                entries.append(f"Ctrl+Shift+{slot} → {ch}")
             self._kde_status_lbl.set_markup(
                 "<small><span foreground='#008800'>● Active: "
                 + GLib.markup_escape_text(" · ".join(entries))
