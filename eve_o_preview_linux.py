@@ -1092,6 +1092,9 @@ class _ThumbnailItem(Gtk.Box):
         self.config = config
         self.is_active = False
         self._poll_id = None
+        # Current slot binding for sort ordering. 0 = unassigned (sorts to
+        # end). Updated by ThumbnailDock.update_slot_order().
+        self.slot = 0
 
         # Image container with optional active-state CSS border
         self.frame = Gtk.Frame()
@@ -1221,6 +1224,10 @@ class ThumbnailDock(Gtk.Window):
         self.flow.set_margin_bottom(6)
         self.flow.set_margin_start(6)
         self.flow.set_margin_end(6)
+        # Keep items ordered by slot number — without this, removing a
+        # middle item and re-adding it later leaves gaps and out-of-order
+        # neighbours. Items with slot=0 (unassigned) sort to the end.
+        self.flow.set_sort_func(self._sort_by_slot, None)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1289,6 +1296,37 @@ class ThumbnailDock(Gtk.Window):
                 item.update_label_from_window()
             except Exception:
                 pass
+
+    @staticmethod
+    def _sort_by_slot(c1, c2, _data):
+        i1 = c1.get_child()
+        i2 = c2.get_child()
+        s1 = getattr(i1, "slot", 0) or 999
+        s2 = getattr(i2, "slot", 0) or 999
+        if s1 != s2:
+            return -1 if s1 < s2 else 1
+        # Tiebreak on xid so order is stable when both are unassigned.
+        x1 = getattr(i1, "xid", 0)
+        x2 = getattr(i2, "xid", 0)
+        return -1 if x1 < x2 else (1 if x1 > x2 else 0)
+
+    def update_slot_order(self, bindings):
+        """Apply current slot bindings (slot_str → {xid, …}) to items so
+        the FlowBox can re-sort. Call after every _write_slots_state."""
+        xid_to_slot = {}
+        for slot_str, info in (bindings or {}).items():
+            try:
+                xid_to_slot[int(info["xid"], 16)] = int(slot_str)
+            except (TypeError, ValueError, KeyError):
+                continue
+        changed = False
+        for xid, item in self.items.items():
+            new_slot = xid_to_slot.get(xid, 0)
+            if item.slot != new_slot:
+                item.slot = new_slot
+                changed = True
+        if changed:
+            self.flow.invalidate_sort()
 
 
 class Config:
@@ -2603,7 +2641,8 @@ class EVEOPreview(Gtk.Window):
 
     def _write_slots_state(self):
         """Recompute current slot→client bindings, atomically write the
-        state file, and reconcile kglobalaccel registrations to match."""
+        state file, propagate ordering into the dock, and reconcile
+        kglobalaccel registrations to match."""
         try:
             bindings = self._compute_slot_bindings()
             state = {
@@ -2624,6 +2663,15 @@ class EVEOPreview(Gtk.Window):
         except Exception as e:
             print(f"[slots] write error: {e}")
             bindings = {}
+
+        # Push the new ordering to the dock so it re-sorts the FlowBox by
+        # slot number, eliminating gaps/out-of-order tiles after a client
+        # disconnects and reopens.
+        if self._dock is not None:
+            try:
+                self._dock.update_slot_order(bindings)
+            except Exception as e:
+                print(f"[dock] reorder error: {e}")
 
         # Portal bindings are FIXED at startup (slots 1..max_hotkey_slots).
         # We do not re-bind when EVE clients open/close — slots.json provides
