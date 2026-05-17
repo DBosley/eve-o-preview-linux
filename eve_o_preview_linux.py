@@ -8,7 +8,7 @@
 # - Live previews via GdkX11 + gdk_pixbuf_get_from_window
 # - Wayland: auto-detects and forces XWayland backend (EVE runs via XWayland anyway)
 
-import os, sys, json, warnings, shutil, secrets
+import os, sys, json, time, warnings, shutil, secrets
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
@@ -52,6 +52,12 @@ def _ensure_proper_systemd_scope():
         sys.executable, os.path.abspath(__file__), *sys.argv[1:],
     ]
     try:
+        with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+            _lg.write(f"[{__import__('time').time():.3f}] relocate pid={os.getpid()} "
+                      f"-> {' '.join(cmd)}\n")
+    except OSError:
+        pass
+    try:
         os.execvp(cmd[0], cmd)
     except OSError as e:
         # Fall through and run in the wrong scope — better than crashing.
@@ -59,6 +65,24 @@ def _ensure_proper_systemd_scope():
 
 
 _ensure_proper_systemd_scope()
+
+# Startup trace — written every launch (after any scope relocation).
+# Survives stdout detachment, so launcher-spawned crashes leave evidence.
+try:
+    with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+        _lg.write(f"\n[{time.time():.3f}] === launch pid={os.getpid()} ===\n")
+        _lg.write(f"  argv={sys.argv}\n")
+        try:
+            with open(f"/proc/{os.getpid()}/cgroup") as _cg:
+                _lg.write(f"  cgroup={_cg.read().strip().splitlines()[-1]}\n")
+        except OSError:
+            pass
+        for _k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE",
+                   "GDK_BACKEND", "DBUS_SESSION_BUS_ADDRESS",
+                   "XDG_CURRENT_DESKTOP", "EVE_O_PREVIEW_IN_SCOPE"):
+            _lg.write(f"  {_k}={os.environ.get(_k, '<unset>')}\n")
+except OSError:
+    pass
 
 # Wayland detection: if running under Wayland, force GDK to use the X11/XWayland
 # backend. EVE Online on Linux always runs through Wine/Proton -> XWayland, so
@@ -3016,12 +3040,32 @@ class EVEOPreview(Gtk.Window):
                 print(f"[portal] shutdown error: {e}")
 
     def _show_settings(self, _btn):
-        dialog = SettingsDialog(self, self.config)
+        # Diagnostic trace — survives even when stdout is detached
+        # (launcher launches send stdout to the journal at best).
+        try:
+            import traceback as _tb
+            with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+                _lg.write(f"[{time.time():.3f}] _show_settings click; "
+                          f"win mapped={self.get_mapped()} "
+                          f"visible={self.get_visible()} "
+                          f"realized={self.get_realized()}\n")
+        except Exception:
+            pass
+        try:
+            dialog = SettingsDialog(self, self.config)
+        except Exception:
+            with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+                _lg.write(f"[{time.time():.3f}] SettingsDialog __init__ RAISED:\n")
+                _tb.print_exc(file=_lg)
+            return
         # show_all() already runs inside SettingsDialog.__init__; present()
         # also raises the window to the top of its stacking layer. Avoid
         # present_with_time(CURRENT_TIME=0) — Wayland focus-stealing
         # prevention sometimes treats the missing timestamp as stale.
         dialog.present()
+        with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+            _lg.write(f"[{time.time():.3f}] dialog created and presented; "
+                      f"about to call run()\n")
         if dialog.run() == Gtk.ResponseType.OK:
             dialog.save_settings()
             for t in self.thumbnails.values():
@@ -3046,6 +3090,11 @@ class EVEOPreview(Gtk.Window):
                 if t.live_window:
                     t._start_live_timer()
         dialog.destroy()
+        try:
+            with open("/tmp/eve-o-preview-settings.log", "a") as _lg:
+                _lg.write(f"[{time.time():.3f}] dialog destroyed; restoring focus\n")
+        except Exception:
+            pass
         # Restore focus + raise the main window. Without this, KDE/Wayland
         # sometimes leaves the management window without keyboard focus after
         # a modal-run() completes, which makes the next click on the Settings
