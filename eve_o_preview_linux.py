@@ -8,8 +8,57 @@
 # - Live previews via GdkX11 + gdk_pixbuf_get_from_window
 # - Wayland: auto-detects and forces XWayland backend (EVE runs via XWayland anyway)
 
-import os, json, warnings
+import os, sys, json, warnings, shutil, secrets
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+def _ensure_proper_systemd_scope():
+    """Re-exec into a properly-named systemd user scope.
+
+    xdg-desktop-portal-kde derives the per-app identity used for
+    GlobalShortcuts persistence from the *systemd cgroup scope* of the
+    calling process — it looks for ``app-<APPID>-*.scope`` and uses
+    ``APPID`` as the portal app_id. Launching from a terminal or a basic
+    launcher (gtk-launch, gio launch) inherits the launcher's own scope
+    (e.g. ``kitty-NNN.scope``), so xdp-kde sees ``app_id=""`` and our
+    persisted ``[eve-o-preview]`` bindings can never be matched.
+
+    Relocate by re-execing under ``systemd-run --user --scope`` with the
+    expected unit name. The guard env var prevents an infinite re-exec
+    loop if we're already inside the right scope (or systemd lies)."""
+    if os.environ.get("EVE_O_PREVIEW_IN_SCOPE") == "1":
+        return
+    try:
+        with open(f"/proc/{os.getpid()}/cgroup", "r") as f:
+            cgroup = f.read()
+    except OSError:
+        return
+    if "/app-eve-o-preview-" in cgroup:
+        print(f"[eve-o-preview] scope OK: {cgroup.strip().splitlines()[-1]}",
+              flush=True)
+        return
+    if shutil.which("systemd-run") is None:
+        return
+    print(f"[eve-o-preview] relocating from {cgroup.strip().splitlines()[-1]} "
+          f"into a fresh app-eve-o-preview-*.scope", flush=True)
+    if os.environ.get("DBUS_SESSION_BUS_ADDRESS") is None and \
+            os.environ.get("XDG_RUNTIME_DIR") is None:
+        return  # no user systemd to talk to
+    os.environ["EVE_O_PREVIEW_IN_SCOPE"] = "1"
+    suffix = secrets.token_hex(4)
+    cmd = [
+        "systemd-run", "--user", "--scope", "--quiet", "--collect",
+        f"--unit=app-eve-o-preview-{suffix}",
+        sys.executable, os.path.abspath(__file__), *sys.argv[1:],
+    ]
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        # Fall through and run in the wrong scope — better than crashing.
+        print(f"[eve-o-preview] scope relocation skipped: {e}", file=sys.stderr)
+
+
+_ensure_proper_systemd_scope()
 
 # Wayland detection: if running under Wayland, force GDK to use the X11/XWayland
 # backend. EVE Online on Linux always runs through Wine/Proton -> XWayland, so
