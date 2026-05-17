@@ -1348,6 +1348,13 @@ class Config:
             "slot_assignments": {},
             "max_hotkey_slots": 9,
             "kde_hotkeys_enabled": True,
+            # Set to True after the first successful portal BindShortcuts call.
+            # Drives the auto-rebind on next launch: KDE persists the user's
+            # chosen triggers in kglobalshortcutsrc, but they fire only while a
+            # portal session is actively bound to them. Without this flag we'd
+            # have to choose between (a) surprising fresh installs with a
+            # permission dialog or (b) forcing every launch to click Register.
+            "kde_hotkeys_registered": False,
             # Dock mode: all thumbnails live inside a single resizable window
             # with a flow layout that adapts row/column count to width. When
             # off, each thumbnail is its own floating window (legacy behavior).
@@ -2072,6 +2079,14 @@ class EVEOPreview(Gtk.Window):
                 print(f"[portal] disabled: {e}")
                 self._portal = None
 
+        # KDE persists portal shortcuts across runs but each new process must
+        # rebind the session for them to actually fire. Auto-rebind once we
+        # know the user has registered before — BindShortcuts is silent when
+        # every ID already exists in kglobalshortcutsrc for this app_id.
+        if (self._portal is not None
+                and self.config.settings.get("kde_hotkeys_registered", False)):
+            GLib.idle_add(self._auto_rebind_shortcuts)
+
         self.set_title("EVE-O Preview")
         self.set_default_size(500, 400)
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -2197,6 +2212,16 @@ class EVEOPreview(Gtk.Window):
             self._portal.stop()  # idempotent — ensures clean state
             self._portal.start()
         return True
+
+    def _auto_rebind_shortcuts(self):
+        """Silent rebind on app launch — no dialog because the IDs already
+        exist in kglobalshortcutsrc. Reuses ``register_global_shortcuts`` so
+        the desired list stays in sync with the user-facing path."""
+        try:
+            self.register_global_shortcuts()
+        except Exception as e:
+            print(f"[portal] auto-rebind failed: {e}")
+        return False  # one-shot idle
 
     def _apply_styles(self):
         css_provider = Gtk.CssProvider()
@@ -2902,8 +2927,17 @@ class EVEOPreview(Gtk.Window):
                 pass
 
     def _on_portal_state(self, state):
-        """Receive state transitions from the portal client (logging hook)."""
+        """Receive state transitions from the portal client. On the first
+        successful "active" transition, persist the registered flag so future
+        launches auto-rebind silently."""
         print(f"[portal] state → {state}")
+        if state == "active" and not self.config.settings.get(
+                "kde_hotkeys_registered", False):
+            self.config.settings["kde_hotkeys_registered"] = True
+            try:
+                self.config.save()
+            except Exception as e:
+                print(f"[portal] config save after registration failed: {e}")
 
     def shutdown_hotkeys(self):
         """Tear down portal session and signal subscription. Called on exit."""
@@ -3548,6 +3582,13 @@ class SettingsDialog(Gtk.Dialog):
             self._parent_app._portal.stop()
         except Exception as e:
             print(f"[portal] unregister error: {e}")
+        # Clear the auto-rebind flag so the next launch doesn't silently
+        # re-establish the session the user just torn down.
+        self.config.settings["kde_hotkeys_registered"] = False
+        try:
+            self.config.save()
+        except Exception as e:
+            print(f"[portal] config save after unregister failed: {e}")
         self._refresh_kde_status_label()
 
     def _refresh_kde_status_label(self):
