@@ -2949,6 +2949,15 @@ class EVEOPreview(Gtk.Window):
 
     def _show_settings(self, _btn):
         dialog = SettingsDialog(self, self.config)
+        # Explicitly raise/focus the dialog. show_all() already runs inside
+        # SettingsDialog.__init__, but on a dock-mode session that's not
+        # enough — the dock's keep_above competes with the dialog's, and the
+        # dialog can land below it. present_with_time() asks the WM to
+        # foreground it.
+        try:
+            dialog.present_with_time(Gdk.CURRENT_TIME)
+        except Exception:
+            dialog.present()
         if dialog.run() == Gtk.ResponseType.OK:
             dialog.save_settings()
             for t in self.thumbnails.values():
@@ -2985,12 +2994,20 @@ class EVEOPreview(Gtk.Window):
 
 class SettingsDialog(Gtk.Dialog):
     def __init__(self, parent, config):
-        super().__init__(title="Settings", parent=parent, flags=0)
+        super().__init__(
+            title="Settings",
+            parent=parent,
+            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+        )
         self.config = config
         self._parent_app = parent   # EVEOPreview — used by Hotkeys tab
         self._slot_widgets = {}     # character_name → Gtk.SpinButton
         self.set_default_size(520, 560)
         self.set_resizable(False)
+        # The dock and the main window both keep_above=True. Without matching
+        # that, the modal dialog gets buried beneath them and looks like it
+        # "won't open." Force the dialog into the ABOVE layer too.
+        self.set_keep_above(True)
 
         # Header bar for dialog
         headerbar = Gtk.HeaderBar()
