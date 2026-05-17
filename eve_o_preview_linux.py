@@ -867,6 +867,25 @@ class _PortalGlobalShortcuts:
         self._set_state("binding-shortcuts")
         self._bind_shortcuts()
 
+    def purge_kde_bindings(self, kglobalaccel_component="eve_o_preview"):
+        """Wipe the component's persisted shortcuts from KDE's kglobalaccel
+        store. Without this, ``BindShortcuts`` on the next launch sees the
+        existing IDs in ``kglobalshortcutsrc`` and reuses them silently — so
+        clicking Register after Unregister would never re-prompt for new
+        triggers. ``cleanUp`` removes the component entirely; the next bind
+        re-creates it with a fresh permission dialog."""
+        try:
+            self._bus.call_sync(
+                "org.kde.kglobalaccel",
+                f"/component/{kglobalaccel_component}",
+                "org.kde.kglobalaccel.Component", "cleanUp",
+                None, None, self._Gio.DBusCallFlags.NONE, 5000, None,
+            )
+            print(f"[portal] kglobalaccel component '{kglobalaccel_component}' cleaned")
+        except Exception as e:
+            # Non-KDE environments won't have kglobalaccel. Swallow.
+            print(f"[portal] kglobalaccel cleanup skipped: {e}")
+
     # ------------------------------------------------------------------
     # Internal: state + tokens
     # ------------------------------------------------------------------
@@ -2949,15 +2968,11 @@ class EVEOPreview(Gtk.Window):
 
     def _show_settings(self, _btn):
         dialog = SettingsDialog(self, self.config)
-        # Explicitly raise/focus the dialog. show_all() already runs inside
-        # SettingsDialog.__init__, but on a dock-mode session that's not
-        # enough — the dock's keep_above competes with the dialog's, and the
-        # dialog can land below it. present_with_time() asks the WM to
-        # foreground it.
-        try:
-            dialog.present_with_time(Gdk.CURRENT_TIME)
-        except Exception:
-            dialog.present()
+        # show_all() already runs inside SettingsDialog.__init__; present()
+        # also raises the window to the top of its stacking layer. Avoid
+        # present_with_time(CURRENT_TIME=0) — Wayland focus-stealing
+        # prevention sometimes treats the missing timestamp as stale.
+        dialog.present()
         if dialog.run() == Gtk.ResponseType.OK:
             dialog.save_settings()
             for t in self.thumbnails.values():
@@ -2982,6 +2997,14 @@ class EVEOPreview(Gtk.Window):
                 if t.live_window:
                     t._start_live_timer()
         dialog.destroy()
+        # Restore focus + raise the main window. Without this, KDE/Wayland
+        # sometimes leaves the management window without keyboard focus after
+        # a modal-run() completes, which makes the next click on the Settings
+        # button get swallowed by the WM until the user re-focuses manually.
+        try:
+            self.present()
+        except Exception:
+            pass
 
     def _update_status(self):
         count = len(self.thumbnails)
@@ -2997,16 +3020,18 @@ class SettingsDialog(Gtk.Dialog):
         super().__init__(
             title="Settings",
             parent=parent,
-            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+            flags=Gtk.DialogFlags.DESTROY_WITH_PARENT,
         )
         self.config = config
         self._parent_app = parent   # EVEOPreview — used by Hotkeys tab
         self._slot_widgets = {}     # character_name → Gtk.SpinButton
         self.set_default_size(520, 560)
         self.set_resizable(False)
-        # The dock and the main window both keep_above=True. Without matching
-        # that, the modal dialog gets buried beneath them and looks like it
-        # "won't open." Force the dialog into the ABOVE layer too.
+        # The dock and main window both keep_above=True. Match that so the
+        # dialog doesn't get buried under them. Combining keep_above with the
+        # MODAL flag confuses KWin's input grab on Wayland (the next Settings
+        # button click stops registering), so rely on Gtk.Dialog.run()'s own
+        # nested loop for modality and skip the WM-level modal flag.
         self.set_keep_above(True)
 
         # Header bar for dialog
@@ -3595,10 +3620,19 @@ class SettingsDialog(Gtk.Dialog):
     def _on_unregister_clicked(self, _btn):
         if self._parent_app is None or self._parent_app._portal is None:
             return
+        portal = self._parent_app._portal
         try:
-            self._parent_app._portal.stop()
+            portal.stop()
         except Exception as e:
             print(f"[portal] unregister error: {e}")
+        # Closing the session alone doesn't remove the bindings KDE saved in
+        # kglobalshortcutsrc — Register would then silently reuse them and
+        # never re-prompt. Purge the kglobalaccel component so the next
+        # Register click triggers a fresh OS dialog.
+        try:
+            portal.purge_kde_bindings()
+        except Exception as e:
+            print(f"[portal] kglobalaccel purge error: {e}")
         # Clear the auto-rebind flag so the next launch doesn't silently
         # re-establish the session the user just torn down.
         self.config.settings["kde_hotkeys_registered"] = False
